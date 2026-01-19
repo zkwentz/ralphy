@@ -24,6 +24,12 @@ SHOW_CONFIG=false
 ADD_RULE=""
 AUTO_COMMIT=true
 
+# Metrics options
+SHOW_METRICS=false
+RESET_METRICS=false
+ENABLE_ADAPTIVE_SELECTION=true
+EXPORT_METRICS=""
+
 # Runtime options
 SKIP_TESTS=false
 SKIP_LINT=false
@@ -77,6 +83,7 @@ total_actual_cost="0"  # OpenCode provides actual cost
 total_duration_ms=0    # Cursor provides duration
 iteration=0
 retry_count=0
+task_start_time=0      # Track individual task duration for metrics
 declare -a parallel_pids=()
 declare -a task_branches=()
 declare -a integration_branches=()  # Track integration branches for cleanup on interrupt
@@ -109,6 +116,12 @@ log_debug() {
     echo "${DIM}[DEBUG] $*${RESET}"
   fi
 }
+
+# Source metrics module if available
+if [[ -f "$RALPHY_DIR/metrics.sh" ]]; then
+  # shellcheck source=.ralphy/metrics.sh
+  source "$RALPHY_DIR/metrics.sh"
+fi
 
 # Slugify text for branch names
 slugify() {
@@ -275,6 +288,21 @@ EOF
   # Create progress.txt
   echo "# Ralphy Progress Log" > "$PROGRESS_FILE"
   echo "" >> "$PROGRESS_FILE"
+
+  # Copy metrics.sh module if available (from script directory)
+  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$script_dir/.ralphy/metrics.sh" ]]; then
+    cp "$script_dir/.ralphy/metrics.sh" "$RALPHY_DIR/metrics.sh"
+  elif [[ -f "$(dirname "$0")/.ralphy/metrics.sh" ]]; then
+    cp "$(dirname "$0")/.ralphy/metrics.sh" "$RALPHY_DIR/metrics.sh"
+  fi
+
+  # Initialize metrics file
+  if [[ -f "$RALPHY_DIR/metrics.sh" ]]; then
+    # shellcheck source=.ralphy/metrics.sh
+    source "$RALPHY_DIR/metrics.sh"
+    init_metrics_file
+  fi
 
   log_success "Created $RALPHY_DIR/"
   echo ""
@@ -620,6 +648,12 @@ ${BOLD}PRD SOURCE OPTIONS:${RESET}
   --github REPO       Fetch tasks from GitHub issues (e.g., owner/repo)
   --github-label TAG  Filter GitHub issues by label
 
+${BOLD}METRICS & LEARNING:${RESET}
+  --show-metrics      Display engine performance metrics
+  --reset-metrics     Clear all metrics history
+  --export-metrics    Export metrics to JSON file
+  --no-adapt          Disable adaptive engine selection
+
 ${BOLD}OTHER OPTIONS:${RESET}
   -v, --verbose       Show debug output
   -h, --help          Show this help
@@ -789,6 +823,23 @@ parse_args() {
         ;;
       --no-commit)
         AUTO_COMMIT=false
+        shift
+        ;;
+      --show-metrics)
+        SHOW_METRICS=true
+        shift
+        ;;
+      --reset-metrics)
+        RESET_METRICS=true
+        shift
+        ;;
+      --export-metrics)
+        EXPORT_METRICS="${2:-.ralphy/metrics-report.json}"
+        shift
+        [[ "$1" != -* ]] && shift || true
+        ;;
+      --no-adapt)
+        ENABLE_ADAPTIVE_SELECTION=false
         shift
         ;;
       -*)
@@ -1687,9 +1738,12 @@ calculate_cost() {
 run_single_task() {
   local task_name="${1:-}"
   local task_num="${2:-$iteration}"
-  
+
   retry_count=0
-  
+
+  # Record task start time for metrics
+  task_start_time=$(date +%s%3N 2>/dev/null || echo "0")
+
   echo ""
   echo "${BOLD}>>> Task $task_num${RESET}"
   
@@ -1715,6 +1769,16 @@ run_single_task() {
   fi
   
   current_step="Thinking"
+
+  # Adaptive engine selection based on task pattern
+  local original_engine="$AI_ENGINE"
+  if [[ "$ENABLE_ADAPTIVE_SELECTION" == true ]] && command -v get_best_engine_for_pattern &>/dev/null; then
+    local suggested_engine=$(get_best_engine_for_pattern "$current_task" 5)
+    if [[ -n "$suggested_engine" ]]; then
+      AI_ENGINE="$suggested_engine"
+      log_debug "Adaptive selection: using $AI_ENGINE (was $original_engine) for pattern match"
+    fi
+  fi
 
   # Create branch if needed
   local branch_name=""
@@ -1856,6 +1920,26 @@ run_single_task() {
     # Return to base branch
     return_to_base_branch
 
+    # Record metrics for successful task execution
+    if command -v record_execution &>/dev/null; then
+      local task_end_time=$(date +%s%3N 2>/dev/null || echo "0")
+      local task_duration_ms=0
+      if [[ "$task_start_time" -gt 0 ]] && [[ "$task_end_time" -gt 0 ]]; then
+        task_duration_ms=$((task_end_time - task_start_time))
+      fi
+
+      # Calculate cost for this task
+      local task_cost="0"
+      if [[ -n "$actual_cost" ]] && [[ "$actual_cost" != duration:* ]]; then
+        task_cost="$actual_cost"
+      elif command -v calculate_cost &>/dev/null; then
+        task_cost=$(calculate_cost "$input_tokens" "$output_tokens")
+      fi
+
+      record_execution "$AI_ENGINE" "$current_task" true "$task_duration_ms" "$input_tokens" "$output_tokens" "$task_cost"
+      log_debug "Metrics recorded: engine=$AI_ENGINE, success=true, duration=${task_duration_ms}ms"
+    fi
+
     # Check for completion - verify by actually counting remaining tasks
     local remaining_count
     remaining_count=$(count_remaining_tasks | tr -d '[:space:]' | head -1)
@@ -1873,6 +1957,18 @@ run_single_task() {
 
     return 0
   done
+
+  # Record metrics for failed task execution
+  if command -v record_execution &>/dev/null; then
+    local task_end_time=$(date +%s%3N 2>/dev/null || echo "0")
+    local task_duration_ms=0
+    if [[ "$task_start_time" -gt 0 ]] && [[ "$task_end_time" -gt 0 ]]; then
+      task_duration_ms=$((task_end_time - task_start_time))
+    fi
+
+    record_execution "$AI_ENGINE" "${current_task:-unknown}" false "$task_duration_ms" 0 0 "0"
+    log_debug "Metrics recorded: engine=$AI_ENGINE, success=false, duration=${task_duration_ms}ms"
+  fi
 
   return_to_base_branch
   return 1
@@ -2760,6 +2856,36 @@ main() {
   # Handle --add-rule
   if [[ -n "$ADD_RULE" ]]; then
     add_ralphy_rule "$ADD_RULE"
+    exit 0
+  fi
+
+  # Handle --show-metrics
+  if [[ "$SHOW_METRICS" == true ]]; then
+    if command -v show_metrics_report &>/dev/null; then
+      show_metrics_report
+    else
+      log_error "Metrics module not available. Run tasks first to generate metrics."
+    fi
+    exit 0
+  fi
+
+  # Handle --reset-metrics
+  if [[ "$RESET_METRICS" == true ]]; then
+    if command -v reset_metrics &>/dev/null; then
+      reset_metrics
+    else
+      log_error "Metrics module not available."
+    fi
+    exit 0
+  fi
+
+  # Handle --export-metrics
+  if [[ -n "$EXPORT_METRICS" ]]; then
+    if command -v export_metrics_report &>/dev/null; then
+      export_metrics_report "$EXPORT_METRICS"
+    else
+      log_error "Metrics module not available."
+    fi
     exit 0
   fi
 
