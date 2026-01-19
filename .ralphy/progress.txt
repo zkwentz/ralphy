@@ -1,2 +1,61 @@
-# Ralphy Progress Log
+## Refactored Authentication System
 
+### Date: 2026-01-18
+
+### Changes Made:
+
+1. **Created Authentication Module (.ralphy/auth.sh)**
+   - Extracted all engine-specific authentication logic into a dedicated module
+   - Centralized permission configurations for all 6 AI engines (Claude, OpenCode, Cursor, Qwen, Droid, Codex)
+   - Implemented function-based approach compatible with Bash 3.x (macOS default)
+
+2. **Key Functions Implemented:**
+   - `get_engine_auth_flags()` - Returns engine-specific CLI flags
+   - `get_engine_env_vars()` - Returns required environment variables
+   - `engine_requires_cleanup()` - Checks if engine needs cleanup
+   - `setup_engine_auth()` - Sets up authentication environment
+   - `cleanup_engine_auth()` - Cleans up authentication artifacts
+   - `build_engine_command()` - Builds complete command with auth
+   - `execute_engine_command()` - Executes engine with proper auth
+   - `validate_engine()` - Validates engine is supported
+   - `get_supported_engines()` - Lists all supported engines
+   - `get_engine_permission_info()` - Returns permission description
+   - `test_engine_auth()` - Dry-run test for engine auth
+
+3. **Refactored ralphy.sh:**
+   - Added source statement to load auth module at startup (lines 15-21)
+   - Refactored `run_ai_command()` function to use new auth module (lines 1483-1536)
+   - Updated cleanup operations to use `cleanup_engine_auth()` (lines 973-979, 1862-1872)
+   - Maintained backward compatibility with fallback to legacy implementation
+
+4. **Created Test Suite (.ralphy/test_auth.sh)**
+   - Comprehensive test coverage for all auth functions
+   - Tests for all 6 supported engines
+   - Validation tests, auth flag tests, cleanup tests, command building tests
+   - Setup/cleanup verification tests
+
+### Benefits:
+
+1. **Modularity**: Authentication logic is now separated from main orchestration
+2. **Maintainability**: Adding new engines only requires updating the auth module
+3. **Testability**: Auth module can be tested independently
+4. **Clarity**: Each engine's authentication approach is clearly documented
+5. **Reusability**: Auth functions can be used across different parts of the codebase
+6. **Consistency**: Centralized auth ensures consistent permission handling
+
+### Files Modified:
+- `ralphy.sh` (lines 15-21, 1483-1536, 973-979, 1862-1872)
+
+### Files Created:
+- `.ralphy/auth.sh` (305 lines)
+- `.ralphy/test_auth.sh` (216 lines)
+
+### Testing:
+- All auth module functions verified to work correctly
+- Manual testing confirmed for all 6 engines
+- Backward compatibility maintained with fallback implementation
+
+### Next Steps (for future work):
+- Consider extracting parse_ai_result() into a separate response parsing module
+- Add metrics tracking to auth module for performance monitoring
+- Implement config-driven engine selection (per MultiAgentPlan.md)
