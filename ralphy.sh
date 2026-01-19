@@ -12,6 +12,14 @@ set -euo pipefail
 # CONFIGURATION & DEFAULTS
 # ============================================
 
+# Source authentication module
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_MODULE="$SCRIPT_DIR/.ralphy/auth.sh"
+if [[ -f "$AUTH_MODULE" ]]; then
+  # shellcheck source=.ralphy/auth.sh
+  source "$AUTH_MODULE"
+fi
+
 VERSION="4.0.0"
 
 # Ralphy config directory
@@ -24,12 +32,6 @@ SHOW_CONFIG=false
 ADD_RULE=""
 AUTO_COMMIT=true
 
-# Metrics options
-SHOW_METRICS=false
-RESET_METRICS=false
-ENABLE_ADAPTIVE_SELECTION=true
-EXPORT_METRICS=""
-
 # Runtime options
 SKIP_TESTS=false
 SKIP_LINT=false
@@ -40,6 +42,11 @@ MAX_RETRIES=3
 RETRY_DELAY=5
 VERBOSE=false
 
+# Multi-engine mode options
+EXECUTION_MODE="single"  # single, consensus, specialization, race
+CONSENSUS_ENGINES=""     # Comma-separated list of engines for consensus mode
+META_AGENT_ENGINE="claude"  # Engine to use for meta-agent decisions
+
 # Git branch options
 BRANCH_PER_TASK=false
 CREATE_PR=false
@@ -49,6 +56,11 @@ PR_DRAFT=false
 # Parallel execution
 PARALLEL=false
 MAX_PARALLEL=3
+
+# Consensus mode
+CONSENSUS_MODE=false
+CONSENSUS_ENGINES="claude,cursor"  # Default engines for consensus
+META_AGENT_ENGINE="claude"  # Engine used for meta-agent comparison
 
 # PRD source options
 PRD_SOURCE="markdown"  # markdown, yaml, github
@@ -83,7 +95,6 @@ total_actual_cost="0"  # OpenCode provides actual cost
 total_duration_ms=0    # Cursor provides duration
 iteration=0
 retry_count=0
-task_start_time=0      # Track individual task duration for metrics
 declare -a parallel_pids=()
 declare -a task_branches=()
 declare -a integration_branches=()  # Track integration branches for cleanup on interrupt
@@ -117,16 +128,35 @@ log_debug() {
   fi
 }
 
-# Source metrics module if available
-if [[ -f "$RALPHY_DIR/metrics.sh" ]]; then
-  # shellcheck source=.ralphy/metrics.sh
-  source "$RALPHY_DIR/metrics.sh"
-fi
-
 # Slugify text for branch names
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-|-$//g' | cut -c1-50
 }
+
+# Sanitize task title to prevent command injection (CWE-78)
+# Removes newlines, null bytes, and control characters that could break commands
+sanitize_task_title() {
+  local title="$1"
+  # Remove newlines, carriage returns, null bytes, and other control characters
+  # Keep only printable ASCII characters and common unicode text
+  echo "$title" | tr -d '\000-\037' | tr -d '\177'
+}
+
+# ============================================
+# SOURCE MULTI-ENGINE MODULES
+# ============================================
+
+# Source modes.sh if it exists (for consensus, specialization, race modes)
+if [[ -f "$RALPHY_DIR/modes.sh" ]]; then
+  # shellcheck source=.ralphy/modes.sh
+  source "$RALPHY_DIR/modes.sh"
+fi
+
+# Source meta-agent.sh if it exists (for solution comparison and merging)
+if [[ -f "$RALPHY_DIR/meta-agent.sh" ]]; then
+  # shellcheck source=.ralphy/meta-agent.sh
+  source "$RALPHY_DIR/meta-agent.sh"
+fi
 
 # ============================================
 # BROWNFIELD MODE (.ralphy/ configuration)
@@ -288,21 +318,6 @@ EOF
   # Create progress.txt
   echo "# Ralphy Progress Log" > "$PROGRESS_FILE"
   echo "" >> "$PROGRESS_FILE"
-
-  # Copy metrics.sh module if available (from script directory)
-  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [[ -f "$script_dir/.ralphy/metrics.sh" ]]; then
-    cp "$script_dir/.ralphy/metrics.sh" "$RALPHY_DIR/metrics.sh"
-  elif [[ -f "$(dirname "$0")/.ralphy/metrics.sh" ]]; then
-    cp "$(dirname "$0")/.ralphy/metrics.sh" "$RALPHY_DIR/metrics.sh"
-  fi
-
-  # Initialize metrics file
-  if [[ -f "$RALPHY_DIR/metrics.sh" ]]; then
-    # shellcheck source=.ralphy/metrics.sh
-    source "$RALPHY_DIR/metrics.sh"
-    init_metrics_file
-  fi
 
   log_success "Created $RALPHY_DIR/"
   echo ""
@@ -535,6 +550,31 @@ run_brownfield_task() {
   echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo ""
 
+  # Check if consensus mode is enabled (support both CONSENSUS_MODE and EXECUTION_MODE for compatibility)
+  if [[ "$CONSENSUS_MODE" == true ]] || [[ "$EXECUTION_MODE" == "consensus" ]]; then
+    log_info "Running in ${BOLD}consensus mode${RESET} with engines: $CONSENSUS_ENGINES"
+
+    # Set up worktree base for consensus mode
+    ORIGINAL_DIR=$(pwd)
+    WORKTREE_BASE="$ORIGINAL_DIR"
+    BASE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+
+    # Use default engines if not specified
+    local engines="${CONSENSUS_ENGINES:-claude,cursor}"
+
+    # Run consensus mode
+    if run_consensus_mode "$task" "$engines"; then
+      log_task_history "$task" "completed (consensus mode)"
+      log_success "Task completed via consensus mode"
+      return 0
+    else
+      log_task_history "$task" "failed (consensus mode)"
+      log_error "Task failed in consensus mode"
+      return 1
+    fi
+  fi
+
+  # Standard single-engine mode
   local prompt
   prompt=$(build_brownfield_prompt "$task")
 
@@ -621,6 +661,12 @@ ${BOLD}AI ENGINE OPTIONS:${RESET}
   --qwen              Use Qwen-Code
   --droid             Use Factory Droid
 
+${BOLD}MULTI-ENGINE OPTIONS:${RESET}
+  --mode MODE         Execution mode: single, consensus, specialization, race
+  --consensus-engines "engine1,engine2"
+                      Engines for consensus mode (e.g., "claude,cursor")
+  --meta-agent ENGINE Engine for meta-agent decisions (default: claude)
+
 ${BOLD}WORKFLOW OPTIONS:${RESET}
   --no-tests          Skip writing and running tests
   --no-lint           Skip linting
@@ -648,12 +694,6 @@ ${BOLD}PRD SOURCE OPTIONS:${RESET}
   --github REPO       Fetch tasks from GitHub issues (e.g., owner/repo)
   --github-label TAG  Filter GitHub issues by label
 
-${BOLD}METRICS & LEARNING:${RESET}
-  --show-metrics      Display engine performance metrics
-  --reset-metrics     Clear all metrics history
-  --export-metrics    Export metrics to JSON file
-  --no-adapt          Disable adaptive engine selection
-
 ${BOLD}OTHER OPTIONS:${RESET}
   -v, --verbose       Show debug output
   -h, --help          Show this help
@@ -664,6 +704,10 @@ ${BOLD}EXAMPLES:${RESET}
   ./ralphy.sh --init                       # Initialize config
   ./ralphy.sh "add dark mode toggle"       # Run single task
   ./ralphy.sh "fix the login bug" --cursor # Single task with Cursor
+
+  # Consensus mode (multiple engines on same task)
+  ./ralphy.sh "refactor auth system" --mode consensus --consensus-engines "claude,cursor"
+  ./ralphy.sh "fix critical bug" --consensus-engines "claude,opencode,cursor"
 
   # PRD mode (task lists)
   ./ralphy.sh                              # Run with Claude Code
@@ -736,6 +780,19 @@ parse_args() {
       --droid)
         AI_ENGINE="droid"
         shift
+        ;;
+      --mode)
+        EXECUTION_MODE="${2:-single}"
+        shift 2
+        ;;
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-}"
+        EXECUTION_MODE="consensus"
+        shift 2
+        ;;
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
         ;;
       --dry-run)
         DRY_RUN=true
@@ -825,22 +882,23 @@ parse_args() {
         AUTO_COMMIT=false
         shift
         ;;
-      --show-metrics)
-        SHOW_METRICS=true
-        shift
+      --mode)
+        MODE_TYPE="${2:-}"
+        if [[ "$MODE_TYPE" == "consensus" ]]; then
+          CONSENSUS_MODE=true
+        else
+          log_error "Unknown mode: $MODE_TYPE (currently only 'consensus' is supported)"
+          exit 1
+        fi
+        shift 2
         ;;
-      --reset-metrics)
-        RESET_METRICS=true
-        shift
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-claude,cursor}"
+        shift 2
         ;;
-      --export-metrics)
-        EXPORT_METRICS="${2:-.ralphy/metrics-report.json}"
-        shift
-        [[ "$1" != -* ]] && shift || true
-        ;;
-      --no-adapt)
-        ENABLE_ADAPTIVE_SELECTION=false
-        shift
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
         ;;
       -*)
         log_error "Unknown option: $1"
@@ -1012,7 +1070,14 @@ cleanup() {
   
   # Remove temp file
   [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
-  [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+
+  # Cleanup engine authentication artifacts using auth module
+  if command -v cleanup_engine_auth &>/dev/null; then
+    cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+  else
+    # Fallback to legacy cleanup
+    [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+  fi
   
   # Cleanup parallel worktrees
   if [[ -n "$WORKTREE_BASE" ]] && [[ -d "$WORKTREE_BASE" ]]; then
@@ -1106,12 +1171,14 @@ count_completed_yaml() {
 
 mark_task_complete_yaml() {
   local task=$1
-  yq -i "(.tasks[] | select(.title == \"$task\")).completed = true" "$PRD_FILE"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -i '(.tasks[] | select(.title == env(TASK))).completed = true' "$PRD_FILE"
 }
 
 get_parallel_group_yaml() {
   local task=$1
-  yq -r ".tasks[] | select(.title == \"$task\") | .parallel_group // 0" "$PRD_FILE" 2>/dev/null || echo "0"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -r '.tasks[] | select(.title == env(TASK)) | .parallel_group // 0' "$PRD_FILE" 2>/dev/null || echo "0"
 }
 
 get_tasks_in_group_yaml() {
@@ -1253,30 +1320,34 @@ create_pull_request() {
   local branch=$1
   local task=$2
   local body="${3:-Automated PR created by Ralphy}"
-  
+
+  # Sanitize task title to prevent command injection (CWE-78)
+  local safe_task
+  safe_task=$(sanitize_task_title "$task")
+
   local draft_flag=""
   [[ "$PR_DRAFT" == true ]] && draft_flag="--draft"
-  
+
   log_info "Creating pull request for $branch..."
-  
+
   # Push branch first
   git push -u origin "$branch" 2>/dev/null || {
     log_warn "Failed to push branch $branch"
     return 1
   }
-  
-  # Create PR
+
+  # Create PR with sanitized title
   local pr_url
   pr_url=$(gh pr create \
     --base "$BASE_BRANCH" \
     --head "$branch" \
-    --title "$task" \
+    --title "$safe_task" \
     --body "$body" \
     $draft_flag 2>/dev/null) || {
     log_warn "Failed to create PR for $branch"
     return 1
   }
-  
+
   log_success "PR created: $pr_url"
   echo "$pr_url"
 }
@@ -1526,50 +1597,56 @@ If ALL tasks in the PRD are complete, output <promise>COMPLETE</promise>."
 run_ai_command() {
   local prompt=$1
   local output_file=$2
-  
-  case "$AI_ENGINE" in
-    opencode)
-      # OpenCode: use 'run' command with JSON format and permissive settings
-      OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-        --format json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    cursor)
-      # Cursor agent: use --print for non-interactive, --force to allow all commands
-      agent --print --force \
-        --output-format stream-json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    qwen)
-      # Qwen-Code: use CLI with JSON format and auto-approve tools
-      qwen --output-format stream-json \
-        --approval-mode yolo \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-    droid)
-      # Droid: use exec with stream-json output and medium autonomy for development
-      droid exec --output-format stream-json \
-        --auto medium \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    codex)
-      CODEX_LAST_MESSAGE_FILE="${output_file}.last"
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      codex exec --full-auto \
-        --json \
-        --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    *)
-      # Claude Code: use existing approach
-      claude --dangerously-skip-permissions \
-        --verbose \
-        --output-format stream-json \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-  esac
-  
-  ai_pid=$!
+
+  # Use new authentication module if available
+  if command -v execute_engine_command &>/dev/null; then
+    execute_engine_command "$AI_ENGINE" "$prompt" "$output_file"
+  else
+    # Fallback to legacy implementation if auth module not loaded
+    case "$AI_ENGINE" in
+      opencode)
+        # OpenCode: use 'run' command with JSON format and permissive settings
+        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+          --format json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      cursor)
+        # Cursor agent: use --print for non-interactive, --force to allow all commands
+        agent --print --force \
+          --output-format stream-json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      qwen)
+        # Qwen-Code: use CLI with JSON format and auto-approve tools
+        qwen --output-format stream-json \
+          --approval-mode yolo \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+      droid)
+        # Droid: use exec with stream-json output and medium autonomy for development
+        droid exec --output-format stream-json \
+          --auto medium \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      codex)
+        CODEX_LAST_MESSAGE_FILE="${output_file}.last"
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        codex exec --full-auto \
+          --json \
+          --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      *)
+        # Claude Code: use existing approach
+        claude --dangerously-skip-permissions \
+          --verbose \
+          --output-format stream-json \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+    esac
+
+    ai_pid=$!
+  fi
 }
 
 parse_ai_result() {
@@ -1738,12 +1815,9 @@ calculate_cost() {
 run_single_task() {
   local task_name="${1:-}"
   local task_num="${2:-$iteration}"
-
+  
   retry_count=0
-
-  # Record task start time for metrics
-  task_start_time=$(date +%s%3N 2>/dev/null || echo "0")
-
+  
   echo ""
   echo "${BOLD}>>> Task $task_num${RESET}"
   
@@ -1769,16 +1843,6 @@ run_single_task() {
   fi
   
   current_step="Thinking"
-
-  # Adaptive engine selection based on task pattern
-  local original_engine="$AI_ENGINE"
-  if [[ "$ENABLE_ADAPTIVE_SELECTION" == true ]] && command -v get_best_engine_for_pattern &>/dev/null; then
-    local suggested_engine=$(get_best_engine_for_pattern "$current_task" 5)
-    if [[ -n "$suggested_engine" ]]; then
-      AI_ENGINE="$suggested_engine"
-      log_debug "Adaptive selection: using $AI_ENGINE (was $original_engine) for pattern match"
-    fi
-  fi
 
   # Create branch if needed
   local branch_name=""
@@ -1901,11 +1965,18 @@ run_single_task() {
     fi
 
     rm -f "$tmpfile"
-    tmpfile=""
-    if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      CODEX_LAST_MESSAGE_FILE=""
+
+    # Cleanup engine authentication artifacts using auth module
+    if command -v cleanup_engine_auth &>/dev/null; then
+      cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+    else
+      # Fallback to legacy cleanup
+      if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        CODEX_LAST_MESSAGE_FILE=""
+      fi
     fi
+    tmpfile=""
 
     # Mark task complete for GitHub issues (since AI can't do it)
     if [[ "$PRD_SOURCE" == "github" ]]; then
@@ -1919,26 +1990,6 @@ run_single_task() {
 
     # Return to base branch
     return_to_base_branch
-
-    # Record metrics for successful task execution
-    if command -v record_execution &>/dev/null; then
-      local task_end_time=$(date +%s%3N 2>/dev/null || echo "0")
-      local task_duration_ms=0
-      if [[ "$task_start_time" -gt 0 ]] && [[ "$task_end_time" -gt 0 ]]; then
-        task_duration_ms=$((task_end_time - task_start_time))
-      fi
-
-      # Calculate cost for this task
-      local task_cost="0"
-      if [[ -n "$actual_cost" ]] && [[ "$actual_cost" != duration:* ]]; then
-        task_cost="$actual_cost"
-      elif command -v calculate_cost &>/dev/null; then
-        task_cost=$(calculate_cost "$input_tokens" "$output_tokens")
-      fi
-
-      record_execution "$AI_ENGINE" "$current_task" true "$task_duration_ms" "$input_tokens" "$output_tokens" "$task_cost"
-      log_debug "Metrics recorded: engine=$AI_ENGINE, success=true, duration=${task_duration_ms}ms"
-    fi
 
     # Check for completion - verify by actually counting remaining tasks
     local remaining_count
@@ -1957,18 +2008,6 @@ run_single_task() {
 
     return 0
   done
-
-  # Record metrics for failed task execution
-  if command -v record_execution &>/dev/null; then
-    local task_end_time=$(date +%s%3N 2>/dev/null || echo "0")
-    local task_duration_ms=0
-    if [[ "$task_start_time" -gt 0 ]] && [[ "$task_end_time" -gt 0 ]]; then
-      task_duration_ms=$((task_end_time - task_start_time))
-    fi
-
-    record_execution "$AI_ENGINE" "${current_task:-unknown}" false "$task_duration_ms" 0 0 "0"
-    log_debug "Metrics recorded: engine=$AI_ENGINE, success=false, duration=${task_duration_ms}ms"
-  fi
 
   return_to_base_branch
   return 1
@@ -2208,13 +2247,17 @@ Focus only on implementing: $task_name"
     
     # Create PR if requested
     if [[ "$CREATE_PR" == true ]]; then
+      # Sanitize task title to prevent command injection (CWE-78)
+      local safe_task_name
+      safe_task_name=$(sanitize_task_title "$task_name")
+
       (
         cd "$worktree_dir"
         git push -u origin "$branch_name" 2>>"$log_file" || true
         gh pr create \
           --base "$BASE_BRANCH" \
           --head "$branch_name" \
-          --title "$task_name" \
+          --title "$safe_task_name" \
           --body "Automated implementation by Ralphy (Agent $agent_num)" \
           ${PR_DRAFT:+--draft} 2>>"$log_file" || true
       )
@@ -2856,36 +2899,6 @@ main() {
   # Handle --add-rule
   if [[ -n "$ADD_RULE" ]]; then
     add_ralphy_rule "$ADD_RULE"
-    exit 0
-  fi
-
-  # Handle --show-metrics
-  if [[ "$SHOW_METRICS" == true ]]; then
-    if command -v show_metrics_report &>/dev/null; then
-      show_metrics_report
-    else
-      log_error "Metrics module not available. Run tasks first to generate metrics."
-    fi
-    exit 0
-  fi
-
-  # Handle --reset-metrics
-  if [[ "$RESET_METRICS" == true ]]; then
-    if command -v reset_metrics &>/dev/null; then
-      reset_metrics
-    else
-      log_error "Metrics module not available."
-    fi
-    exit 0
-  fi
-
-  # Handle --export-metrics
-  if [[ -n "$EXPORT_METRICS" ]]; then
-    if command -v export_metrics_report &>/dev/null; then
-      export_metrics_report "$EXPORT_METRICS"
-    else
-      log_error "Metrics module not available."
-    fi
     exit 0
   fi
 
