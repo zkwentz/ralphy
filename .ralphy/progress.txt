@@ -1,0 +1,48 @@
+## Progress: Meta-agent decision parsing
+
+### Completed:
+- Created `.ralphy/meta-agent.sh` with complete meta-agent decision parsing functionality
+- Implemented `parse_meta_decision()` function that:
+  - Parses meta-agent output format with DECISION, CHOSEN, REASONING fields
+  - Handles both "select" and "merge" decision types
+  - Extracts merged solution code blocks when present
+  - Validates all required fields and decision types
+  - Returns JSON-formatted output with properly escaped strings
+  - Handles multiline reasoning text
+  - Case-insensitive and whitespace-tolerant parsing
+
+- Implemented helper functions:
+  - `prepare_meta_prompt()`: Builds comparison prompt for multiple solutions
+  - `run_meta_agent()`: Executes meta-agent with multiple engine support (claude, opencode, cursor)
+  - `merge_solutions()`: Placeholder for applying merged solutions
+
+- Created comprehensive test suite `.ralphy/test-meta-agent.sh` with 32 tests covering:
+  - SELECT decision parsing
+  - MERGE decision parsing with code blocks
+  - Missing required fields validation
+  - Invalid decision type handling
+  - Case insensitivity and whitespace handling
+  - Multiline reasoning support
+  - Code blocks with language specifiers
+  - Error conditions and edge cases
+  - Prompt preparation
+
+### Test Results:
+All 32 tests pass successfully ✓
+
+### Implementation Details:
+- Uses bash regex matching for robust parsing
+- Avoids xargs to prevent quote-related issues with custom trim() function for whitespace handling
+- Portable JSON string escaping for special characters
+- Multi-engine support for meta-agent execution
+- Exports functions for use in main ralphy.sh script
+
+### Files Created:
+1. `.ralphy/meta-agent.sh` - Meta-agent decision parsing module (342 lines)
+2. `.ralphy/test-meta-agent.sh` - Test suite (476 lines, 32 tests)
+
+### Next Steps (for future PRs):
+- Integrate meta-agent.sh into main ralphy.sh
+- Implement consensus mode that uses meta-agent
+- Add metrics tracking for meta-agent decisions
+- Implement full merge_solutions() logic
