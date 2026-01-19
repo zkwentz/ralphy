@@ -12,6 +12,14 @@ set -euo pipefail
 # CONFIGURATION & DEFAULTS
 # ============================================
 
+# Source authentication module
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_MODULE="$SCRIPT_DIR/.ralphy/auth.sh"
+if [[ -f "$AUTH_MODULE" ]]; then
+  # shellcheck source=.ralphy/auth.sh
+  source "$AUTH_MODULE"
+fi
+
 VERSION="4.0.0"
 
 # Ralphy config directory
@@ -34,6 +42,11 @@ MAX_RETRIES=3
 RETRY_DELAY=5
 VERBOSE=false
 
+# Multi-engine mode options
+EXECUTION_MODE="single"  # single, consensus, specialization, race
+CONSENSUS_ENGINES=""     # Comma-separated list of engines for consensus mode
+META_AGENT_ENGINE="claude"  # Engine to use for meta-agent decisions
+
 # Git branch options
 BRANCH_PER_TASK=false
 CREATE_PR=false
@@ -44,11 +57,22 @@ PR_DRAFT=false
 PARALLEL=false
 MAX_PARALLEL=3
 
+# Consensus mode
+CONSENSUS_MODE=false
+CONSENSUS_ENGINES="claude,cursor"  # Default engines for consensus
+META_AGENT_ENGINE="claude"  # Engine used for meta-agent comparison
+
 # PRD source options
 PRD_SOURCE="markdown"  # markdown, yaml, github
 PRD_FILE="PRD.md"
 GITHUB_REPO=""
 GITHUB_LABEL=""
+
+# Cost control options
+MAX_COST_PER_TASK=0     # 0 = unlimited
+MAX_COST_PER_SESSION=0  # 0 = unlimited
+COST_WARN_THRESHOLD=0.75  # Warn at 75% of limit
+task_start_cost=0       # Track cost at task start for per-task limit
 
 # Colors (detect if terminal supports colors)
 if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
@@ -114,6 +138,31 @@ log_debug() {
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-|-$//g' | cut -c1-50
 }
+
+# Sanitize task title to prevent command injection (CWE-78)
+# Removes newlines, null bytes, and control characters that could break commands
+sanitize_task_title() {
+  local title="$1"
+  # Remove newlines, carriage returns, null bytes, and other control characters
+  # Keep only printable ASCII characters and common unicode text
+  echo "$title" | tr -d '\000-\037' | tr -d '\177'
+}
+
+# ============================================
+# SOURCE MULTI-ENGINE MODULES
+# ============================================
+
+# Source modes.sh if it exists (for consensus, specialization, race modes)
+if [[ -f "$RALPHY_DIR/modes.sh" ]]; then
+  # shellcheck source=.ralphy/modes.sh
+  source "$RALPHY_DIR/modes.sh"
+fi
+
+# Source meta-agent.sh if it exists (for solution comparison and merging)
+if [[ -f "$RALPHY_DIR/meta-agent.sh" ]]; then
+  # shellcheck source=.ralphy/meta-agent.sh
+  source "$RALPHY_DIR/meta-agent.sh"
+fi
 
 # ============================================
 # BROWNFIELD MODE (.ralphy/ configuration)
@@ -270,6 +319,16 @@ boundaries:
     # - "src/legacy/**"
     # - "migrations/**"
     # - "*.lock"
+
+# Cost controls - prevent runaway costs
+cost_controls:
+  max_per_task: 0      # Maximum USD per task (0 = unlimited)
+  max_per_session: 0   # Maximum USD per session (0 = unlimited)
+  warn_threshold: 0.75 # Warn when reaching this % of limit (default 75%)
+  # Examples:
+  # max_per_task: 5.00
+  # max_per_session: 50.00
+  # warn_threshold: 0.75
 EOF
 
   # Create progress.txt
@@ -367,6 +426,26 @@ show_ralphy_config() {
       done
       echo ""
     fi
+
+    # Cost controls
+    local max_task max_session warn_thresh
+    max_task=$(yq -r '.cost_controls.max_per_task // 0' "$CONFIG_FILE" 2>/dev/null)
+    max_session=$(yq -r '.cost_controls.max_per_session // 0' "$CONFIG_FILE" 2>/dev/null)
+    warn_thresh=$(yq -r '.cost_controls.warn_threshold // 0.75' "$CONFIG_FILE" 2>/dev/null)
+
+    echo "${BOLD}Cost Controls:${RESET}"
+    if [[ "$max_task" != "0" ]]; then
+      echo "  Max per task:    \$$max_task"
+    else
+      echo "  Max per task:    ${DIM}unlimited${RESET}"
+    fi
+    if [[ "$max_session" != "0" ]]; then
+      echo "  Max per session: \$$max_session"
+    else
+      echo "  Max per session: ${DIM}unlimited${RESET}"
+    fi
+    echo "  Warn threshold:  ${warn_thresh}"
+    echo ""
   else
     # Fallback: just show the file
     cat "$CONFIG_FILE"
@@ -507,6 +586,31 @@ run_brownfield_task() {
   echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo ""
 
+  # Check if consensus mode is enabled (support both CONSENSUS_MODE and EXECUTION_MODE for compatibility)
+  if [[ "$CONSENSUS_MODE" == true ]] || [[ "$EXECUTION_MODE" == "consensus" ]]; then
+    log_info "Running in ${BOLD}consensus mode${RESET} with engines: $CONSENSUS_ENGINES"
+
+    # Set up worktree base for consensus mode
+    ORIGINAL_DIR=$(pwd)
+    WORKTREE_BASE="$ORIGINAL_DIR"
+    BASE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+
+    # Use default engines if not specified
+    local engines="${CONSENSUS_ENGINES:-claude,cursor}"
+
+    # Run consensus mode
+    if run_consensus_mode "$task" "$engines"; then
+      log_task_history "$task" "completed (consensus mode)"
+      log_success "Task completed via consensus mode"
+      return 0
+    else
+      log_task_history "$task" "failed (consensus mode)"
+      log_error "Task failed in consensus mode"
+      return 1
+    fi
+  fi
+
+  # Standard single-engine mode
   local prompt
   prompt=$(build_brownfield_prompt "$task")
 
@@ -593,6 +697,12 @@ ${BOLD}AI ENGINE OPTIONS:${RESET}
   --qwen              Use Qwen-Code
   --droid             Use Factory Droid
 
+${BOLD}MULTI-ENGINE OPTIONS:${RESET}
+  --mode MODE         Execution mode: single, consensus, specialization, race
+  --consensus-engines "engine1,engine2"
+                      Engines for consensus mode (e.g., "claude,cursor")
+  --meta-agent ENGINE Engine for meta-agent decisions (default: claude)
+
 ${BOLD}WORKFLOW OPTIONS:${RESET}
   --no-tests          Skip writing and running tests
   --no-lint           Skip linting
@@ -630,6 +740,10 @@ ${BOLD}EXAMPLES:${RESET}
   ./ralphy.sh --init                       # Initialize config
   ./ralphy.sh "add dark mode toggle"       # Run single task
   ./ralphy.sh "fix the login bug" --cursor # Single task with Cursor
+
+  # Consensus mode (multiple engines on same task)
+  ./ralphy.sh "refactor auth system" --mode consensus --consensus-engines "claude,cursor"
+  ./ralphy.sh "fix critical bug" --consensus-engines "claude,opencode,cursor"
 
   # PRD mode (task lists)
   ./ralphy.sh                              # Run with Claude Code
@@ -702,6 +816,19 @@ parse_args() {
       --droid)
         AI_ENGINE="droid"
         shift
+        ;;
+      --mode)
+        EXECUTION_MODE="${2:-single}"
+        shift 2
+        ;;
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-}"
+        EXECUTION_MODE="consensus"
+        shift 2
+        ;;
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
         ;;
       --dry-run)
         DRY_RUN=true
@@ -791,6 +918,24 @@ parse_args() {
         AUTO_COMMIT=false
         shift
         ;;
+      --mode)
+        MODE_TYPE="${2:-}"
+        if [[ "$MODE_TYPE" == "consensus" ]]; then
+          CONSENSUS_MODE=true
+        else
+          log_error "Unknown mode: $MODE_TYPE (currently only 'consensus' is supported)"
+          exit 1
+        fi
+        shift 2
+        ;;
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-claude,cursor}"
+        shift 2
+        ;;
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
+        ;;
       -*)
         log_error "Unknown option: $1"
         echo "Use --help for usage"
@@ -815,6 +960,9 @@ parse_args() {
 
 check_requirements() {
   local missing=()
+
+  # Load cost limits from config if available
+  load_cost_limits
 
   # Check for PRD source
   case "$PRD_SOURCE" in
@@ -961,7 +1109,14 @@ cleanup() {
   
   # Remove temp file
   [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
-  [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+
+  # Cleanup engine authentication artifacts using auth module
+  if command -v cleanup_engine_auth &>/dev/null; then
+    cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+  else
+    # Fallback to legacy cleanup
+    [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+  fi
   
   # Cleanup parallel worktrees
   if [[ -n "$WORKTREE_BASE" ]] && [[ -d "$WORKTREE_BASE" ]]; then
@@ -1055,12 +1210,14 @@ count_completed_yaml() {
 
 mark_task_complete_yaml() {
   local task=$1
-  yq -i "(.tasks[] | select(.title == \"$task\")).completed = true" "$PRD_FILE"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -i '(.tasks[] | select(.title == env(TASK))).completed = true' "$PRD_FILE"
 }
 
 get_parallel_group_yaml() {
   local task=$1
-  yq -r ".tasks[] | select(.title == \"$task\") | .parallel_group // 0" "$PRD_FILE" 2>/dev/null || echo "0"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -r '.tasks[] | select(.title == env(TASK)) | .parallel_group // 0' "$PRD_FILE" 2>/dev/null || echo "0"
 }
 
 get_tasks_in_group_yaml() {
@@ -1202,30 +1359,34 @@ create_pull_request() {
   local branch=$1
   local task=$2
   local body="${3:-Automated PR created by Ralphy}"
-  
+
+  # Sanitize task title to prevent command injection (CWE-78)
+  local safe_task
+  safe_task=$(sanitize_task_title "$task")
+
   local draft_flag=""
   [[ "$PR_DRAFT" == true ]] && draft_flag="--draft"
-  
+
   log_info "Creating pull request for $branch..."
-  
+
   # Push branch first
   git push -u origin "$branch" 2>/dev/null || {
     log_warn "Failed to push branch $branch"
     return 1
   }
-  
-  # Create PR
+
+  # Create PR with sanitized title
   local pr_url
   pr_url=$(gh pr create \
     --base "$BASE_BRANCH" \
     --head "$branch" \
-    --title "$task" \
+    --title "$safe_task" \
     --body "$body" \
     $draft_flag 2>/dev/null) || {
     log_warn "Failed to create PR for $branch"
     return 1
   }
-  
+
   log_success "PR created: $pr_url"
   echo "$pr_url"
 }
@@ -1475,50 +1636,56 @@ If ALL tasks in the PRD are complete, output <promise>COMPLETE</promise>."
 run_ai_command() {
   local prompt=$1
   local output_file=$2
-  
-  case "$AI_ENGINE" in
-    opencode)
-      # OpenCode: use 'run' command with JSON format and permissive settings
-      OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-        --format json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    cursor)
-      # Cursor agent: use --print for non-interactive, --force to allow all commands
-      agent --print --force \
-        --output-format stream-json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    qwen)
-      # Qwen-Code: use CLI with JSON format and auto-approve tools
-      qwen --output-format stream-json \
-        --approval-mode yolo \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-    droid)
-      # Droid: use exec with stream-json output and medium autonomy for development
-      droid exec --output-format stream-json \
-        --auto medium \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    codex)
-      CODEX_LAST_MESSAGE_FILE="${output_file}.last"
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      codex exec --full-auto \
-        --json \
-        --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    *)
-      # Claude Code: use existing approach
-      claude --dangerously-skip-permissions \
-        --verbose \
-        --output-format stream-json \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-  esac
-  
-  ai_pid=$!
+
+  # Use new authentication module if available
+  if command -v execute_engine_command &>/dev/null; then
+    execute_engine_command "$AI_ENGINE" "$prompt" "$output_file"
+  else
+    # Fallback to legacy implementation if auth module not loaded
+    case "$AI_ENGINE" in
+      opencode)
+        # OpenCode: use 'run' command with JSON format and permissive settings
+        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+          --format json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      cursor)
+        # Cursor agent: use --print for non-interactive, --force to allow all commands
+        agent --print --force \
+          --output-format stream-json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      qwen)
+        # Qwen-Code: use CLI with JSON format and auto-approve tools
+        qwen --output-format stream-json \
+          --approval-mode yolo \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+      droid)
+        # Droid: use exec with stream-json output and medium autonomy for development
+        droid exec --output-format stream-json \
+          --auto medium \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      codex)
+        CODEX_LAST_MESSAGE_FILE="${output_file}.last"
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        codex exec --full-auto \
+          --json \
+          --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      *)
+        # Claude Code: use existing approach
+        claude --dangerously-skip-permissions \
+          --verbose \
+          --output-format stream-json \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+    esac
+
+    ai_pid=$!
+  fi
 }
 
 parse_ai_result() {
@@ -1666,18 +1833,126 @@ check_for_errors() {
 }
 
 # ============================================
-# COST CALCULATION
+# COST CALCULATION & ENFORCEMENT
 # ============================================
 
 calculate_cost() {
   local input=$1
   local output=$2
-  
+
   if command -v bc &>/dev/null; then
     echo "scale=4; ($input * 0.000003) + ($output * 0.000015)" | bc
   else
     echo "N/A"
   fi
+}
+
+# Load cost limits from config.yaml
+load_cost_limits() {
+  [[ ! -f "$CONFIG_FILE" ]] && return
+
+  if command -v yq &>/dev/null; then
+    local max_task
+    local max_session
+    local warn_thresh
+
+    max_task=$(yq -r '.cost_controls.max_per_task // 0' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    max_session=$(yq -r '.cost_controls.max_per_session // 0' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    warn_thresh=$(yq -r '.cost_controls.warn_threshold // 0.75' "$CONFIG_FILE" 2>/dev/null || echo "0.75")
+
+    # Validate numeric values
+    if [[ "$max_task" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      MAX_COST_PER_TASK="$max_task"
+    fi
+    if [[ "$max_session" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      MAX_COST_PER_SESSION="$max_session"
+    fi
+    if [[ "$warn_thresh" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      COST_WARN_THRESHOLD="$warn_thresh"
+    fi
+  fi
+}
+
+# Get current session cost (estimated or actual)
+get_current_session_cost() {
+  if [[ "$AI_ENGINE" == "opencode" ]] && command -v bc &>/dev/null; then
+    # Use actual cost if available
+    local has_actual_cost
+    has_actual_cost=$(echo "$total_actual_cost > 0" | bc 2>/dev/null || echo "0")
+    if [[ "$has_actual_cost" == "1" ]]; then
+      echo "$total_actual_cost"
+      return
+    fi
+  fi
+
+  # Fallback to estimated cost
+  if command -v bc &>/dev/null; then
+    calculate_cost "$total_input_tokens" "$total_output_tokens"
+  else
+    echo "0"
+  fi
+}
+
+# Check if cost limits are exceeded
+check_cost_limits() {
+  local check_type="${1:-session}"  # "session" or "task"
+
+  # Skip if bc not available or limits not set
+  command -v bc &>/dev/null || return 0
+
+  local current_cost
+  current_cost=$(get_current_session_cost)
+
+  # Validate cost is a number
+  [[ "$current_cost" =~ ^[0-9]+(\.[0-9]+)?$ ]] || current_cost=0
+
+  if [[ "$check_type" == "task" ]] && [[ "$MAX_COST_PER_TASK" != "0" ]]; then
+    # Check per-task limit
+    local task_cost
+    task_cost=$(echo "scale=6; $current_cost - $task_start_cost" | bc 2>/dev/null || echo "0")
+
+    # Check if exceeded
+    local exceeded
+    exceeded=$(echo "$task_cost >= $MAX_COST_PER_TASK" | bc 2>/dev/null || echo "0")
+    if [[ "$exceeded" == "1" ]]; then
+      log_error "Task cost limit exceeded: \$${task_cost} >= \$${MAX_COST_PER_TASK}"
+      return 1
+    fi
+
+    # Check if approaching limit (warn threshold)
+    local warn_level
+    warn_level=$(echo "scale=6; $MAX_COST_PER_TASK * $COST_WARN_THRESHOLD" | bc 2>/dev/null || echo "0")
+    local approaching
+    approaching=$(echo "$task_cost >= $warn_level" | bc 2>/dev/null || echo "0")
+    if [[ "$approaching" == "1" ]]; then
+      local percent
+      percent=$(echo "scale=0; ($task_cost / $MAX_COST_PER_TASK) * 100" | bc 2>/dev/null || echo "0")
+      log_warn "Task cost at ${percent}% of limit: \$${task_cost} / \$${MAX_COST_PER_TASK}"
+    fi
+  fi
+
+  if [[ "$check_type" == "session" ]] && [[ "$MAX_COST_PER_SESSION" != "0" ]]; then
+    # Check session limit
+    local exceeded
+    exceeded=$(echo "$current_cost >= $MAX_COST_PER_SESSION" | bc 2>/dev/null || echo "0")
+    if [[ "$exceeded" == "1" ]]; then
+      log_error "Session cost limit exceeded: \$${current_cost} >= \$${MAX_COST_PER_SESSION}"
+      return 1
+    fi
+
+    # Check if approaching limit (warn threshold)
+    local warn_level
+    warn_level=$(echo "scale=6; $MAX_COST_PER_SESSION * $COST_WARN_THRESHOLD" | bc 2>/dev/null || echo "0")
+    local approaching
+    approaching=$(echo "$current_cost >= $warn_level" | bc 2>/dev/null || echo "0")
+    if [[ "$approaching" == "1" ]]; then
+      local percent
+      percent=$(echo "scale=0; ($current_cost / $MAX_COST_PER_SESSION) * 100" | bc 2>/dev/null || echo "0")
+      log_warn "Session cost at ${percent}% of limit: \$${current_cost} / \$${MAX_COST_PER_SESSION}"
+    fi
+  fi
+
+  return 0
 }
 
 # ============================================
@@ -1687,12 +1962,17 @@ calculate_cost() {
 run_single_task() {
   local task_name="${1:-}"
   local task_num="${2:-$iteration}"
-  
+
   retry_count=0
-  
+
+  # Record cost at task start for per-task limit tracking
+  if command -v bc &>/dev/null; then
+    task_start_cost=$(get_current_session_cost 2>/dev/null || echo "0")
+  fi
+
   echo ""
   echo "${BOLD}>>> Task $task_num${RESET}"
-  
+
   local remaining completed
   remaining=$(count_remaining_tasks | tr -d '[:space:]')
   completed=$(count_completed_tasks | tr -d '[:space:]')
@@ -1708,12 +1988,12 @@ run_single_task() {
   else
     current_task=$(get_next_task)
   fi
-  
+
   if [[ -z "$current_task" ]]; then
     log_info "No more tasks found"
     return 2
   fi
-  
+
   current_step="Thinking"
 
   # Create branch if needed
@@ -1823,7 +2103,7 @@ run_single_task() {
     # Update totals
     total_input_tokens=$((total_input_tokens + input_tokens))
     total_output_tokens=$((total_output_tokens + output_tokens))
-    
+
     # Track actual cost for OpenCode, or duration for Cursor
     if [[ -n "$actual_cost" ]]; then
       if [[ "$actual_cost" == duration:* ]]; then
@@ -1836,12 +2116,36 @@ run_single_task() {
       fi
     fi
 
-    rm -f "$tmpfile"
-    tmpfile=""
-    if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      CODEX_LAST_MESSAGE_FILE=""
+    # Check cost limits after updating totals
+    if ! check_cost_limits "task"; then
+      log_error "Stopping task due to cost limit"
+      rm -f "$tmpfile"
+      tmpfile=""
+      return_to_base_branch
+      return 1
     fi
+    if ! check_cost_limits "session"; then
+      log_error "Stopping session due to cost limit"
+      rm -f "$tmpfile"
+      tmpfile=""
+      return_to_base_branch
+      show_summary
+      exit 1
+    fi
+
+    rm -f "$tmpfile"
+
+    # Cleanup engine authentication artifacts using auth module
+    if command -v cleanup_engine_auth &>/dev/null; then
+      cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+    else
+      # Fallback to legacy cleanup
+      if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        CODEX_LAST_MESSAGE_FILE=""
+      fi
+    fi
+    tmpfile=""
 
     # Mark task complete for GitHub issues (since AI can't do it)
     if [[ "$PRD_SOURCE" == "github" ]]; then
@@ -2112,13 +2416,17 @@ Focus only on implementing: $task_name"
     
     # Create PR if requested
     if [[ "$CREATE_PR" == true ]]; then
+      # Sanitize task title to prevent command injection (CWE-78)
+      local safe_task_name
+      safe_task_name=$(sanitize_task_title "$task_name")
+
       (
         cd "$worktree_dir"
         git push -u origin "$branch_name" 2>>"$log_file" || true
         gh pr create \
           --base "$BASE_BRANCH" \
           --head "$branch_name" \
-          --title "$task_name" \
+          --title "$safe_task_name" \
           --body "Automated implementation by Ralphy (Agent $agent_num)" \
           ${PR_DRAFT:+--draft} 2>>"$log_file" || true
       )
