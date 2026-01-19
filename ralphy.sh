@@ -12,6 +12,14 @@ set -euo pipefail
 # CONFIGURATION & DEFAULTS
 # ============================================
 
+# Source authentication module
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_MODULE="$SCRIPT_DIR/.ralphy/auth.sh"
+if [[ -f "$AUTH_MODULE" ]]; then
+  # shellcheck source=.ralphy/auth.sh
+  source "$AUTH_MODULE"
+fi
+
 VERSION="4.0.0"
 
 # Ralphy config directory
@@ -33,6 +41,11 @@ MAX_ITERATIONS=0  # 0 = unlimited
 MAX_RETRIES=3
 RETRY_DELAY=5
 VERBOSE=false
+
+# Multi-engine mode options
+EXECUTION_MODE="single"  # single, consensus, specialization, race
+CONSENSUS_ENGINES=""     # Comma-separated list of engines for consensus mode
+META_AGENT_ENGINE="claude"  # Engine to use for meta-agent decisions
 
 # Git branch options
 BRANCH_PER_TASK=false
@@ -120,16 +133,28 @@ slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-|-$//g' | cut -c1-50
 }
 
+# Sanitize task title to prevent command injection (CWE-78)
+# Removes newlines, null bytes, and control characters that could break commands
+sanitize_task_title() {
+  local title="$1"
+  # Remove newlines, carriage returns, null bytes, and other control characters
+  # Keep only printable ASCII characters and common unicode text
+  echo "$title" | tr -d '\000-\037' | tr -d '\177'
+}
+
 # ============================================
-# SOURCE ADDITIONAL MODULES
+# SOURCE MULTI-ENGINE MODULES
 # ============================================
 
-# Source consensus mode and meta-agent modules if they exist
+# Source modes.sh if it exists (for consensus, specialization, race modes)
 if [[ -f "$RALPHY_DIR/modes.sh" ]]; then
+  # shellcheck source=.ralphy/modes.sh
   source "$RALPHY_DIR/modes.sh"
 fi
 
+# Source meta-agent.sh if it exists (for solution comparison and merging)
 if [[ -f "$RALPHY_DIR/meta-agent.sh" ]]; then
+  # shellcheck source=.ralphy/meta-agent.sh
   source "$RALPHY_DIR/meta-agent.sh"
 fi
 
@@ -525,8 +550,8 @@ run_brownfield_task() {
   echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo ""
 
-  # Check if consensus mode is enabled
-  if [[ "$CONSENSUS_MODE" == true ]]; then
+  # Check if consensus mode is enabled (support both CONSENSUS_MODE and EXECUTION_MODE for compatibility)
+  if [[ "$CONSENSUS_MODE" == true ]] || [[ "$EXECUTION_MODE" == "consensus" ]]; then
     log_info "Running in ${BOLD}consensus mode${RESET} with engines: $CONSENSUS_ENGINES"
 
     # Set up worktree base for consensus mode
@@ -534,8 +559,11 @@ run_brownfield_task() {
     WORKTREE_BASE="$ORIGINAL_DIR"
     BASE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
 
+    # Use default engines if not specified
+    local engines="${CONSENSUS_ENGINES:-claude,cursor}"
+
     # Run consensus mode
-    if run_consensus_mode "$task" "$CONSENSUS_ENGINES"; then
+    if run_consensus_mode "$task" "$engines"; then
       log_task_history "$task" "completed (consensus mode)"
       log_success "Task completed via consensus mode"
       return 0
@@ -633,6 +661,12 @@ ${BOLD}AI ENGINE OPTIONS:${RESET}
   --qwen              Use Qwen-Code
   --droid             Use Factory Droid
 
+${BOLD}MULTI-ENGINE OPTIONS:${RESET}
+  --mode MODE         Execution mode: single, consensus, specialization, race
+  --consensus-engines "engine1,engine2"
+                      Engines for consensus mode (e.g., "claude,cursor")
+  --meta-agent ENGINE Engine for meta-agent decisions (default: claude)
+
 ${BOLD}WORKFLOW OPTIONS:${RESET}
   --no-tests          Skip writing and running tests
   --no-lint           Skip linting
@@ -670,6 +704,10 @@ ${BOLD}EXAMPLES:${RESET}
   ./ralphy.sh --init                       # Initialize config
   ./ralphy.sh "add dark mode toggle"       # Run single task
   ./ralphy.sh "fix the login bug" --cursor # Single task with Cursor
+
+  # Consensus mode (multiple engines on same task)
+  ./ralphy.sh "refactor auth system" --mode consensus --consensus-engines "claude,cursor"
+  ./ralphy.sh "fix critical bug" --consensus-engines "claude,opencode,cursor"
 
   # PRD mode (task lists)
   ./ralphy.sh                              # Run with Claude Code
@@ -742,6 +780,19 @@ parse_args() {
       --droid)
         AI_ENGINE="droid"
         shift
+        ;;
+      --mode)
+        EXECUTION_MODE="${2:-single}"
+        shift 2
+        ;;
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-}"
+        EXECUTION_MODE="consensus"
+        shift 2
+        ;;
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
         ;;
       --dry-run)
         DRY_RUN=true
@@ -1019,7 +1070,14 @@ cleanup() {
   
   # Remove temp file
   [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
-  [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+
+  # Cleanup engine authentication artifacts using auth module
+  if command -v cleanup_engine_auth &>/dev/null; then
+    cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+  else
+    # Fallback to legacy cleanup
+    [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+  fi
   
   # Cleanup parallel worktrees
   if [[ -n "$WORKTREE_BASE" ]] && [[ -d "$WORKTREE_BASE" ]]; then
@@ -1113,12 +1171,14 @@ count_completed_yaml() {
 
 mark_task_complete_yaml() {
   local task=$1
-  yq -i "(.tasks[] | select(.title == \"$task\")).completed = true" "$PRD_FILE"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -i '(.tasks[] | select(.title == env(TASK))).completed = true' "$PRD_FILE"
 }
 
 get_parallel_group_yaml() {
   local task=$1
-  yq -r ".tasks[] | select(.title == \"$task\") | .parallel_group // 0" "$PRD_FILE" 2>/dev/null || echo "0"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -r '.tasks[] | select(.title == env(TASK)) | .parallel_group // 0' "$PRD_FILE" 2>/dev/null || echo "0"
 }
 
 get_tasks_in_group_yaml() {
@@ -1260,30 +1320,34 @@ create_pull_request() {
   local branch=$1
   local task=$2
   local body="${3:-Automated PR created by Ralphy}"
-  
+
+  # Sanitize task title to prevent command injection (CWE-78)
+  local safe_task
+  safe_task=$(sanitize_task_title "$task")
+
   local draft_flag=""
   [[ "$PR_DRAFT" == true ]] && draft_flag="--draft"
-  
+
   log_info "Creating pull request for $branch..."
-  
+
   # Push branch first
   git push -u origin "$branch" 2>/dev/null || {
     log_warn "Failed to push branch $branch"
     return 1
   }
-  
-  # Create PR
+
+  # Create PR with sanitized title
   local pr_url
   pr_url=$(gh pr create \
     --base "$BASE_BRANCH" \
     --head "$branch" \
-    --title "$task" \
+    --title "$safe_task" \
     --body "$body" \
     $draft_flag 2>/dev/null) || {
     log_warn "Failed to create PR for $branch"
     return 1
   }
-  
+
   log_success "PR created: $pr_url"
   echo "$pr_url"
 }
@@ -1533,50 +1597,56 @@ If ALL tasks in the PRD are complete, output <promise>COMPLETE</promise>."
 run_ai_command() {
   local prompt=$1
   local output_file=$2
-  
-  case "$AI_ENGINE" in
-    opencode)
-      # OpenCode: use 'run' command with JSON format and permissive settings
-      OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-        --format json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    cursor)
-      # Cursor agent: use --print for non-interactive, --force to allow all commands
-      agent --print --force \
-        --output-format stream-json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    qwen)
-      # Qwen-Code: use CLI with JSON format and auto-approve tools
-      qwen --output-format stream-json \
-        --approval-mode yolo \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-    droid)
-      # Droid: use exec with stream-json output and medium autonomy for development
-      droid exec --output-format stream-json \
-        --auto medium \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    codex)
-      CODEX_LAST_MESSAGE_FILE="${output_file}.last"
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      codex exec --full-auto \
-        --json \
-        --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    *)
-      # Claude Code: use existing approach
-      claude --dangerously-skip-permissions \
-        --verbose \
-        --output-format stream-json \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-  esac
-  
-  ai_pid=$!
+
+  # Use new authentication module if available
+  if command -v execute_engine_command &>/dev/null; then
+    execute_engine_command "$AI_ENGINE" "$prompt" "$output_file"
+  else
+    # Fallback to legacy implementation if auth module not loaded
+    case "$AI_ENGINE" in
+      opencode)
+        # OpenCode: use 'run' command with JSON format and permissive settings
+        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+          --format json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      cursor)
+        # Cursor agent: use --print for non-interactive, --force to allow all commands
+        agent --print --force \
+          --output-format stream-json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      qwen)
+        # Qwen-Code: use CLI with JSON format and auto-approve tools
+        qwen --output-format stream-json \
+          --approval-mode yolo \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+      droid)
+        # Droid: use exec with stream-json output and medium autonomy for development
+        droid exec --output-format stream-json \
+          --auto medium \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      codex)
+        CODEX_LAST_MESSAGE_FILE="${output_file}.last"
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        codex exec --full-auto \
+          --json \
+          --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      *)
+        # Claude Code: use existing approach
+        claude --dangerously-skip-permissions \
+          --verbose \
+          --output-format stream-json \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+    esac
+
+    ai_pid=$!
+  fi
 }
 
 parse_ai_result() {
@@ -1895,11 +1965,18 @@ run_single_task() {
     fi
 
     rm -f "$tmpfile"
-    tmpfile=""
-    if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      CODEX_LAST_MESSAGE_FILE=""
+
+    # Cleanup engine authentication artifacts using auth module
+    if command -v cleanup_engine_auth &>/dev/null; then
+      cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+    else
+      # Fallback to legacy cleanup
+      if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        CODEX_LAST_MESSAGE_FILE=""
+      fi
     fi
+    tmpfile=""
 
     # Mark task complete for GitHub issues (since AI can't do it)
     if [[ "$PRD_SOURCE" == "github" ]]; then
@@ -2170,13 +2247,17 @@ Focus only on implementing: $task_name"
     
     # Create PR if requested
     if [[ "$CREATE_PR" == true ]]; then
+      # Sanitize task title to prevent command injection (CWE-78)
+      local safe_task_name
+      safe_task_name=$(sanitize_task_title "$task_name")
+
       (
         cd "$worktree_dir"
         git push -u origin "$branch_name" 2>>"$log_file" || true
         gh pr create \
           --base "$BASE_BRANCH" \
           --head "$branch_name" \
-          --title "$task_name" \
+          --title "$safe_task_name" \
           --body "Automated implementation by Ralphy (Agent $agent_num)" \
           ${PR_DRAFT:+--draft} 2>>"$log_file" || true
       )
