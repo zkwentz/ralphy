@@ -1,0 +1,28 @@
+# Ralphy Configuration
+# https://github.com/michaelshimeles/ralphy
+
+# Project info (auto-detected, edit if needed)
+project:
+  name: "agent-13"
+  language: "Unknown"
+  framework: ""
+  description: ""
+
+# Commands (auto-detected from package.json/pyproject.toml)
+commands:
+  test: ""
+  lint: ""
+  build: ""
+
+# Rules
+rules: []
+
+# Boundaries
+boundaries:
+  never_touch: []
+
+# Cost controls - prevent runaway costs
+cost_controls:
+  max_per_task: 5.00
+  max_per_session: 50.00
+  warn_threshold: 0.75
