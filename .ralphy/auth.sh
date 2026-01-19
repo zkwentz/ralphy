@@ -1,309 +1,304 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Auth Module for Ralphy
-# Provides authentication and authorization functionality
+# ============================================
+# Ralphy Authentication & Permission Module
+# ============================================
+# Handles engine-specific authentication, permission delegation,
+# and command construction for all supported AI engines.
+#
+# Supported Engines:
+# - Claude Code
+# - OpenCode
+# - Cursor Agent
+# - Codex
+# - Qwen-Code
+# - Factory Droid
+# ============================================
 
-# Global variables
-AUTH_USERS_FILE="${AUTH_USERS_FILE:-.ralphy/users.json}"
-AUTH_SESSION_TIMEOUT="${AUTH_SESSION_TIMEOUT:-3600}"
-AUTH_TOKEN_LENGTH="${AUTH_TOKEN_LENGTH:-32}"
+# Note: We don't use 'set -u' here because we check for unset variables explicitly
+set -eo pipefail
 
-# Initialize auth storage
-init_auth() {
-  local users_file=$1
-  if [[ ! -f "$users_file" ]]; then
-    echo '{"users": {}, "sessions": {}}' > "$users_file"
-  fi
+# ============================================
+# ENGINE CONFIGURATIONS
+# ============================================
+
+# Get authentication flags for a specific engine
+# Usage: get_engine_auth_flags <engine_name>
+get_engine_auth_flags() {
+    local engine=$1
+
+    case "$engine" in
+        claude)
+            echo "--dangerously-skip-permissions --verbose --output-format stream-json"
+            ;;
+        opencode)
+            echo "--format json"
+            ;;
+        cursor)
+            echo "--dangerously-skip-permissions --print --force --output-format stream-json"
+            ;;
+        qwen)
+            echo "--output-format stream-json --approval-mode yolo"
+            ;;
+        droid)
+            echo "--output-format stream-json --auto medium"
+            ;;
+        codex)
+            echo "--full-auto --json"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
-# Hash a password (using sha256)
-hash_password() {
-  local password=$1
-  echo -n "$password" | sha256sum | awk '{print $1}'
+# Get environment variables required for a specific engine
+# Usage: get_engine_env_vars <engine_name>
+get_engine_env_vars() {
+    local engine=$1
+
+    case "$engine" in
+        opencode)
+            echo "OPENCODE_PERMISSION"
+            ;;
+        codex)
+            echo "CODEX_LAST_MESSAGE_FILE"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
-# Create a new user
-create_user() {
-  local username=$1
-  local password=$2
-  local users_file="${3:-$AUTH_USERS_FILE}"
+# Check if engine requires cleanup after execution
+# Usage: engine_requires_cleanup <engine_name>
+engine_requires_cleanup() {
+    local engine=$1
 
-  if [[ -z "$username" ]] || [[ -z "$password" ]]; then
-    echo "Error: Username and password required" >&2
-    return 1
-  fi
-
-  # Check if user already exists
-  if user_exists "$username" "$users_file"; then
-    echo "Error: User '$username' already exists" >&2
-    return 1
-  fi
-
-  # Hash the password
-  local hashed_password=$(hash_password "$password")
-
-  # Add user to storage
-  local temp_file=$(mktemp)
-  jq --arg username "$username" \
-     --arg password "$hashed_password" \
-     '.users[$username] = {"password": $password, "created_at": now, "active": true}' \
-     "$users_file" > "$temp_file" && mv "$temp_file" "$users_file"
-
-  echo "User '$username' created successfully"
-  return 0
+    case "$engine" in
+        codex)
+            return 0  # true
+            ;;
+        *)
+            return 1  # false
+            ;;
+    esac
 }
 
-# Check if user exists
-user_exists() {
-  local username=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
+# Setup environment variables for engine authentication
+# Usage: setup_engine_auth <engine_name> <output_file>
+setup_engine_auth() {
+    local engine=$1
+    local output_file=$2
 
-  if [[ ! -f "$users_file" ]]; then
-    return 1
-  fi
-
-  local exists=$(jq -r --arg username "$username" \
-    '.users[$username] // empty' "$users_file")
-
-  [[ -n "$exists" ]]
+    case "$engine" in
+        opencode)
+            # Set OpenCode permission environment variable
+            export OPENCODE_PERMISSION='{"*":"allow"}'
+            ;;
+        codex)
+            # Create last message file for Codex
+            export CODEX_LAST_MESSAGE_FILE="${output_file}.last"
+            rm -f "$CODEX_LAST_MESSAGE_FILE"
+            ;;
+        *)
+            # No special environment setup needed
+            ;;
+    esac
 }
 
-# Authenticate user and return session token
-authenticate() {
-  local username=$1
-  local password=$2
-  local users_file="${3:-$AUTH_USERS_FILE}"
+# Cleanup engine authentication artifacts
+# Usage: cleanup_engine_auth <engine_name> <output_file>
+cleanup_engine_auth() {
+    local engine=$1
+    local output_file=$2
 
-  if [[ -z "$username" ]] || [[ -z "$password" ]]; then
-    echo "Error: Username and password required" >&2
-    return 1
-  fi
-
-  # Check if user exists
-  if ! user_exists "$username" "$users_file"; then
-    echo "Error: Invalid credentials" >&2
-    return 1
-  fi
-
-  # Verify password
-  local hashed_password=$(hash_password "$password")
-  local stored_password=$(jq -r --arg username "$username" \
-    '.users[$username].password' "$users_file")
-
-  if [[ "$hashed_password" != "$stored_password" ]]; then
-    echo "Error: Invalid credentials" >&2
-    return 1
-  fi
-
-  # Check if user is active
-  local is_active=$(jq -r --arg username "$username" \
-    '.users[$username].active' "$users_file")
-
-  if [[ "$is_active" != "true" ]]; then
-    echo "Error: User account is inactive" >&2
-    return 1
-  fi
-
-  # Generate session token
-  local token=$(generate_token)
-  local expires_at=$(($(date +%s) + AUTH_SESSION_TIMEOUT))
-
-  # Store session
-  local temp_file=$(mktemp)
-  jq --arg token "$token" \
-     --arg username "$username" \
-     --arg expires_at "$expires_at" \
-     '.sessions[$token] = {"username": $username, "expires_at": ($expires_at | tonumber), "created_at": now}' \
-     "$users_file" > "$temp_file" && mv "$temp_file" "$users_file"
-
-  echo "$token"
-  return 0
+    case "$engine" in
+        opencode)
+            # Clean up OpenCode environment
+            unset OPENCODE_PERMISSION 2>/dev/null || true
+            ;;
+        codex)
+            # Clean up Codex last message file
+            if [[ -n "${CODEX_LAST_MESSAGE_FILE:-}" ]]; then
+                rm -f "$CODEX_LAST_MESSAGE_FILE"
+                unset CODEX_LAST_MESSAGE_FILE
+            fi
+            ;;
+        *)
+            # No cleanup needed
+            ;;
+    esac
 }
 
-# Generate a random token
-generate_token() {
-  if command -v openssl &> /dev/null; then
-    openssl rand -hex "$((AUTH_TOKEN_LENGTH / 2))"
-  else
-    # Fallback to /dev/urandom
-    cat /dev/urandom | LC_ALL=C tr -dc 'a-f0-9' | fold -w "$AUTH_TOKEN_LENGTH" | head -n 1
-  fi
+# ============================================
+# COMMAND CONSTRUCTION
+# ============================================
+
+# Build the complete command for an engine with authentication
+# Usage: build_engine_command <engine_name> <prompt> <output_file>
+build_engine_command() {
+    local engine=$1
+    local prompt=$2
+    local output_file=$3
+
+    # Setup authentication environment
+    setup_engine_auth "$engine" "$output_file"
+
+    # Get engine-specific flags
+    local auth_flags
+    auth_flags=$(get_engine_auth_flags "$engine")
+
+    # Build the command based on engine
+    case "$engine" in
+        opencode)
+            echo "opencode run $auth_flags \"$prompt\""
+            ;;
+        cursor)
+            echo "agent $auth_flags \"$prompt\""
+            ;;
+        qwen)
+            echo "qwen $auth_flags -p \"$prompt\""
+            ;;
+        droid)
+            echo "droid exec $auth_flags \"$prompt\""
+            ;;
+        codex)
+            echo "codex exec $auth_flags --output-last-message \"$CODEX_LAST_MESSAGE_FILE\" \"$prompt\""
+            ;;
+        claude|*)
+            # Default to Claude Code
+            echo "claude $auth_flags -p \"$prompt\""
+            ;;
+    esac
 }
 
-# Validate a session token
-validate_token() {
-  local token=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
+# Execute engine command with authentication
+# Usage: execute_engine_command <engine_name> <prompt> <output_file>
+# Sets global ai_pid variable for background process tracking
+execute_engine_command() {
+    local engine=$1
+    local prompt=$2
+    local output_file=$3
 
-  if [[ -z "$token" ]]; then
-    echo "Error: Token required" >&2
-    return 1
-  fi
+    # Setup authentication environment
+    setup_engine_auth "$engine" "$output_file"
 
-  if [[ ! -f "$users_file" ]]; then
-    echo "Error: Auth storage not found" >&2
-    return 1
-  fi
+    # Get engine-specific flags
+    local auth_flags
+    auth_flags=$(get_engine_auth_flags "$engine")
 
-  # Get session info
-  local session=$(jq -r --arg token "$token" \
-    '.sessions[$token] // empty' "$users_file")
+    # Execute engine-specific command in background
+    case "$engine" in
+        opencode)
+            OPENCODE_PERMISSION='{"*":"allow"}' \
+                opencode run $auth_flags "$prompt" > "$output_file" 2>&1 &
+            ;;
+        cursor)
+            agent $auth_flags "$prompt" > "$output_file" 2>&1 &
+            ;;
+        qwen)
+            qwen $auth_flags -p "$prompt" > "$output_file" 2>&1 &
+            ;;
+        droid)
+            droid exec $auth_flags "$prompt" > "$output_file" 2>&1 &
+            ;;
+        codex)
+            codex exec $auth_flags \
+                --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+                "$prompt" > "$output_file" 2>&1 &
+            ;;
+        claude|*)
+            claude $auth_flags -p "$prompt" > "$output_file" 2>&1 &
+            ;;
+    esac
 
-  if [[ -z "$session" ]]; then
-    echo "Error: Invalid token" >&2
-    return 1
-  fi
-
-  # Check expiration
-  local expires_at=$(echo "$session" | jq -r '.expires_at')
-  local current_time=$(date +%s)
-
-  if [[ "$current_time" -gt "$expires_at" ]]; then
-    echo "Error: Token expired" >&2
-    return 1
-  fi
-
-  # Return username
-  echo "$session" | jq -r '.username'
-  return 0
+    # Store background process ID
+    ai_pid=$!
 }
 
-# Revoke a session token (logout)
-revoke_token() {
-  local token=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
+# ============================================
+# VALIDATION & UTILITIES
+# ============================================
 
-  if [[ -z "$token" ]]; then
-    echo "Error: Token required" >&2
+# Validate that an engine is supported
+# Usage: validate_engine <engine_name>
+validate_engine() {
+    local engine=$1
+    local supported_engines=("claude" "opencode" "cursor" "qwen" "droid" "codex")
+
+    for supported in "${supported_engines[@]}"; do
+        if [[ "$engine" == "$supported" ]]; then
+            return 0
+        fi
+    done
+
     return 1
-  fi
-
-  # Check if token exists
-  local exists=$(jq -r --arg token "$token" \
-    '.sessions[$token] // empty' "$users_file")
-
-  if [[ -z "$exists" ]]; then
-    echo "Error: Invalid token" >&2
-    return 1
-  fi
-
-  # Remove session
-  local temp_file=$(mktemp)
-  jq --arg token "$token" \
-     'del(.sessions[$token])' \
-     "$users_file" > "$temp_file" && mv "$temp_file" "$users_file"
-
-  echo "Token revoked successfully"
-  return 0
 }
 
-# Deactivate a user account
-deactivate_user() {
-  local username=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
-
-  if [[ -z "$username" ]]; then
-    echo "Error: Username required" >&2
-    return 1
-  fi
-
-  if ! user_exists "$username" "$users_file"; then
-    echo "Error: User '$username' not found" >&2
-    return 1
-  fi
-
-  # Update user status
-  local temp_file=$(mktemp)
-  jq --arg username "$username" \
-     '.users[$username].active = false' \
-     "$users_file" > "$temp_file" && mv "$temp_file" "$users_file"
-
-  echo "User '$username' deactivated successfully"
-  return 0
+# Get list of all supported engines
+# Usage: get_supported_engines
+get_supported_engines() {
+    echo "claude opencode cursor qwen droid codex"
 }
 
-# Activate a user account
-activate_user() {
-  local username=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
+# Get engine-specific permission description
+# Usage: get_engine_permission_info <engine_name>
+get_engine_permission_info() {
+    local engine=$1
 
-  if [[ -z "$username" ]]; then
-    echo "Error: Username required" >&2
-    return 1
-  fi
-
-  if ! user_exists "$username" "$users_file"; then
-    echo "Error: User '$username' not found" >&2
-    return 1
-  fi
-
-  # Update user status
-  local temp_file=$(mktemp)
-  jq --arg username "$username" \
-     '.users[$username].active = true' \
-     "$users_file" > "$temp_file" && mv "$temp_file" "$users_file"
-
-  echo "User '$username' activated successfully"
-  return 0
+    case "$engine" in
+        claude)
+            echo "Autonomous mode with --dangerously-skip-permissions flag"
+            ;;
+        opencode)
+            echo "Wildcard allow permission via OPENCODE_PERMISSION environment variable"
+            ;;
+        cursor)
+            echo "Force mode with --dangerously-skip-permissions and --force flags"
+            ;;
+        qwen)
+            echo "YOLO approval mode with --approval-mode yolo flag"
+            ;;
+        droid)
+            echo "Medium autonomy level with --auto medium flag"
+            ;;
+        codex)
+            echo "Full autonomous mode with --full-auto flag"
+            ;;
+        *)
+            echo "Unknown engine"
+            ;;
+    esac
 }
 
-# Clean up expired sessions
-cleanup_expired_sessions() {
-  local users_file="${1:-$AUTH_USERS_FILE}"
-  local current_time=$(date +%s)
+# ============================================
+# TESTING & DEBUGGING
+# ============================================
 
-  if [[ ! -f "$users_file" ]]; then
+# Test engine authentication setup (dry-run mode)
+# Usage: test_engine_auth <engine_name>
+test_engine_auth() {
+    local engine=$1
+
+    if ! validate_engine "$engine"; then
+        echo "ERROR: Unsupported engine: $engine" >&2
+        return 1
+    fi
+
+    echo "Testing authentication for engine: $engine"
+    echo "  Flags: $(get_engine_auth_flags "$engine")"
+    echo "  Environment: $(get_engine_env_vars "$engine")"
+    echo "  Permission: $(get_engine_permission_info "$engine")"
+    echo "  Requires cleanup: $(engine_requires_cleanup "$engine" && echo "yes" || echo "no")"
+
+    # Build sample command
+    local sample_cmd
+    sample_cmd=$(build_engine_command "$engine" "test prompt" "/tmp/test.txt")
+    echo "  Sample command: $sample_cmd"
+
     return 0
-  fi
-
-  local temp_file=$(mktemp)
-  jq --arg current_time "$current_time" \
-     '.sessions |= with_entries(select(.value.expires_at > ($current_time | tonumber)))' \
-     "$users_file" > "$temp_file" && mv "$temp_file" "$users_file"
-
-  return 0
 }
 
-# Get user info (without sensitive data)
-get_user_info() {
-  local username=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
-
-  if [[ -z "$username" ]]; then
-    echo "Error: Username required" >&2
-    return 1
-  fi
-
-  if ! user_exists "$username" "$users_file"; then
-    echo "Error: User '$username' not found" >&2
-    return 1
-  fi
-
-  jq -r --arg username "$username" \
-    '.users[$username] | {created_at, active}' \
-    "$users_file"
-
-  return 0
-}
-
-# List all active sessions for a user
-list_user_sessions() {
-  local username=$1
-  local users_file="${2:-$AUTH_USERS_FILE}"
-
-  if [[ -z "$username" ]]; then
-    echo "Error: Username required" >&2
-    return 1
-  fi
-
-  if [[ ! -f "$users_file" ]]; then
-    echo "[]"
-    return 0
-  fi
-
-  jq -r --arg username "$username" \
-    '[.sessions | to_entries[] | select(.value.username == $username) | {token: .key, created_at: .value.created_at, expires_at: .value.expires_at}]' \
-    "$users_file"
-
-  return 0
-}
+# Functions are available after sourcing this file
+# No need to export them in modern bash
