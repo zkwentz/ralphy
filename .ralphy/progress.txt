@@ -1,0 +1,95 @@
+# Ralphy Progress Log
+
+## 2026-01-18: Implemented Specialization Mode with Matching Rules
+
+### Overview
+Implemented Phase 3 of the multi-agent architecture: Specialization mode with intelligent task routing based on pattern matching rules.
+
+### Changes Made
+
+#### 1. Created .ralphy/modes.sh Module
+- New module for multi-engine execution modes
+- Implemented `match_specialization_rule()` function for pattern-based task routing
+- Implemented `get_engine_for_task()` function to select best engine for a task
+- Implemented `validate_engine_available()` function to check if engines are installed
+- Implemented `run_specialization_mode()` function to apply specialization routing
+- Added placeholder functions for future consensus, race, and mixed modes
+- Includes logging functions (log_debug, log_warn, log_error)
+
+#### 2. Modified ralphy.sh
+- Added multi-engine mode configuration variables (EXECUTION_MODE, SPECIALIZATION_ENABLED)
+- Added CLI flags: `--mode MODE` and `--specialization`
+- Sourced modes.sh module at startup (lines 95-99)
+- Integrated specialization mode into run_single_task() function (lines 1742-1747)
+- Updated help text to document multi-engine modes
+- Enhanced config initialization to include engines section with specialization_rules
+
+#### 3. Enhanced Configuration Schema
+- Added `engines` section to config.yaml with:
+  - `default_mode`: Single, specialization, consensus, race, or mixed
+  - `available`: List of available AI engines
+  - `specialization_rules`: Pattern-based routing rules with:
+    - `pattern`: Regex pattern to match task descriptions
+    - `engines`: List of engines to use for matching tasks
+    - `mode`: Optional mode override (e.g., "race" for tests)
+    - `description`: Human-readable description of the rule
+
+#### 4. Default Specialization Rules
+Configured default rules for common task types:
+- **UI/Frontend**: Routes to Cursor (pattern: UI|frontend|styling|component|design|button|form|layout)
+- **Refactoring**: Routes to Claude (pattern: refactor|architecture|design pattern|optimize|performance)
+- **Testing**: Routes to Cursor/Codex in race mode (pattern: test|spec|unit test|integration test)
+- **Bug Fixes**: Routes to Claude (pattern: bug|fix.*bug|debug|error|issue|crash)
+- **API Development**: Routes to Claude/OpenCode (pattern: API|endpoint|route|REST|GraphQL)
+- **Database**: Routes to Claude (pattern: database|SQL|query|migration|schema)
+
+#### 5. Testing
+- Created comprehensive test suite: .ralphy/test_specialization.sh
+- Tests cover:
+  - UI pattern matching
+  - Refactoring pattern matching
+  - Test pattern matching
+  - Bug fix pattern matching
+  - No match scenarios
+  - Default engine fallback
+  - Case-insensitive matching
+  - API and database patterns
+- All 10 tests passing successfully
+
+### Usage Examples
+
+```bash
+# Enable specialization mode for all tasks
+./ralphy.sh --specialization --prd PRD.md
+
+# Or set mode explicitly
+./ralphy.sh --mode specialization --prd tasks.yaml
+
+# Single task with specialization
+./ralphy.sh --specialization "Add a login button to the header"
+```
+
+### How It Works
+
+1. When specialization mode is enabled, each task is analyzed before execution
+2. Task description is matched against specialization_rules patterns (case-insensitive regex)
+3. First matching rule determines the engine to use
+4. If no rule matches, falls back to default engine (--claude, --cursor, etc.)
+5. If matched engine is not available, falls back to default engine
+6. Selected engine is used for that specific task
+
+### Benefits
+
+- Intelligent task routing based on task type
+- Maximizes each engine's strengths (e.g., Cursor for UI, Claude for architecture)
+- Configurable via .ralphy/config.yaml
+- Fully backward compatible (defaults to single-engine mode)
+- Foundation for future consensus and race modes
+
+### Next Steps (Future Enhancements)
+
+- Consensus mode: Multiple engines work on same task, meta-agent selects best
+- Race mode: Multiple engines compete, first success wins
+- Mixed mode: Read mode from task definitions
+- Performance metrics tracking to learn engine strengths over time
+

@@ -44,6 +44,10 @@ PR_DRAFT=false
 PARALLEL=false
 MAX_PARALLEL=3
 
+# Multi-engine modes
+EXECUTION_MODE="single"  # single, specialization, consensus, race, mixed
+SPECIALIZATION_ENABLED=false
+
 # PRD source options
 PRD_SOURCE="markdown"  # markdown, yaml, github
 PRD_FILE="PRD.md"
@@ -83,6 +87,16 @@ declare -a integration_branches=()  # Track integration branches for cleanup on 
 WORKTREE_BASE=""  # Base directory for parallel agent worktrees
 ORIGINAL_DIR=""   # Original working directory (for worktree operations)
 ORIGINAL_BASE_BRANCH=""  # Original base branch before integration branches
+
+# ============================================
+# SOURCE MODULES
+# ============================================
+
+# Source modes.sh if it exists (for multi-engine execution modes)
+if [[ -f "$RALPHY_DIR/modes.sh" ]]; then
+  # shellcheck source=.ralphy/modes.sh
+  source "$RALPHY_DIR/modes.sh"
+fi
 
 # ============================================
 # UTILITY FUNCTIONS
@@ -270,6 +284,48 @@ boundaries:
     # - "src/legacy/**"
     # - "migrations/**"
     # - "*.lock"
+
+# Multi-engine configuration (optional)
+engines:
+  # Default execution mode
+  default_mode: "single"  # single, specialization, consensus, race, mixed
+
+  # Available engines
+  available:
+    - claude
+    - opencode
+    - cursor
+    - codex
+    - qwen
+    - droid
+
+  # Specialization routing rules
+  # Routes tasks to specialized engines based on pattern matching
+  specialization_rules:
+    - pattern: "UI|frontend|styling|component|design|button|form|layout"
+      engines: ["cursor"]
+      description: "UI and frontend work"
+
+    - pattern: "refactor|architecture|design pattern|optimize|performance"
+      engines: ["claude"]
+      description: "Complex reasoning and architecture"
+
+    - pattern: "test|spec|unit test|integration test"
+      engines: ["cursor", "codex"]
+      mode: "race"
+      description: "Testing tasks"
+
+    - pattern: "bug|fix.*bug|debug|error|issue|crash"
+      engines: ["claude"]
+      description: "Bug fixes and debugging"
+
+    - pattern: "API|endpoint|route|REST|GraphQL"
+      engines: ["claude", "opencode"]
+      description: "API development"
+
+    - pattern: "database|SQL|query|migration|schema"
+      engines: ["claude"]
+      description: "Database work"
 EOF
 
   # Create progress.txt
@@ -593,6 +649,10 @@ ${BOLD}AI ENGINE OPTIONS:${RESET}
   --qwen              Use Qwen-Code
   --droid             Use Factory Droid
 
+${BOLD}MULTI-ENGINE MODES:${RESET}
+  --mode MODE         Set execution mode: single, specialization, consensus, race, mixed
+  --specialization    Enable specialization mode (auto-route to best engine)
+
 ${BOLD}WORKFLOW OPTIONS:${RESET}
   --no-tests          Skip writing and running tests
   --no-lint           Skip linting
@@ -701,6 +761,15 @@ parse_args() {
         ;;
       --droid)
         AI_ENGINE="droid"
+        shift
+        ;;
+      --mode)
+        EXECUTION_MODE="${2:-single}"
+        shift 2
+        ;;
+      --specialization)
+        EXECUTION_MODE="specialization"
+        SPECIALIZATION_ENABLED=true
         shift
         ;;
       --dry-run)
@@ -1713,8 +1782,15 @@ run_single_task() {
     log_info "No more tasks found"
     return 2
   fi
-  
+
   current_step="Thinking"
+
+  # Apply specialization mode if enabled
+  if [[ "$EXECUTION_MODE" == "specialization" ]] || [[ "$SPECIALIZATION_ENABLED" == "true" ]]; then
+    if declare -f run_specialization_mode &>/dev/null; then
+      run_specialization_mode "$current_task" "$CONFIG_FILE" || true
+    fi
+  fi
 
   # Create branch if needed
   local branch_name=""
