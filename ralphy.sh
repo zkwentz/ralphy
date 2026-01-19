@@ -42,6 +42,11 @@ MAX_RETRIES=3
 RETRY_DELAY=5
 VERBOSE=false
 
+# Multi-engine mode options
+EXECUTION_MODE="single"  # single, consensus, specialization, race
+CONSENSUS_ENGINES=""     # Comma-separated list of engines for consensus mode
+META_AGENT_ENGINE="claude"  # Engine to use for meta-agent decisions
+
 # Git branch options
 BRANCH_PER_TASK=false
 CREATE_PR=false
@@ -131,6 +136,22 @@ sanitize_task_title() {
   # Keep only printable ASCII characters and common unicode text
   echo "$title" | tr -d '\000-\037' | tr -d '\177'
 }
+
+# ============================================
+# SOURCE MULTI-ENGINE MODULES
+# ============================================
+
+# Source modes.sh if it exists (for consensus, specialization, race modes)
+if [[ -f "$RALPHY_DIR/modes.sh" ]]; then
+  # shellcheck source=.ralphy/modes.sh
+  source "$RALPHY_DIR/modes.sh"
+fi
+
+# Source meta-agent.sh if it exists (for solution comparison and merging)
+if [[ -f "$RALPHY_DIR/meta-agent.sh" ]]; then
+  # shellcheck source=.ralphy/meta-agent.sh
+  source "$RALPHY_DIR/meta-agent.sh"
+fi
 
 # ============================================
 # BROWNFIELD MODE (.ralphy/ configuration)
@@ -524,6 +545,26 @@ run_brownfield_task() {
   echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo ""
 
+  # Check if consensus mode is enabled
+  if [[ "$EXECUTION_MODE" == "consensus" ]]; then
+    log_info "Running in consensus mode"
+
+    # Use default engines if not specified
+    local engines="${CONSENSUS_ENGINES:-claude,cursor}"
+
+    # Run consensus mode
+    if run_consensus_mode "$task" "$engines"; then
+      log_task_history "$task" "completed"
+      log_success "Task completed via consensus mode"
+      return 0
+    else
+      log_task_history "$task" "failed"
+      log_error "Task failed in consensus mode"
+      return 1
+    fi
+  fi
+
+  # Standard single-engine mode
   local prompt
   prompt=$(build_brownfield_prompt "$task")
 
@@ -610,6 +651,12 @@ ${BOLD}AI ENGINE OPTIONS:${RESET}
   --qwen              Use Qwen-Code
   --droid             Use Factory Droid
 
+${BOLD}MULTI-ENGINE OPTIONS:${RESET}
+  --mode MODE         Execution mode: single, consensus, specialization, race
+  --consensus-engines "engine1,engine2"
+                      Engines for consensus mode (e.g., "claude,cursor")
+  --meta-agent ENGINE Engine for meta-agent decisions (default: claude)
+
 ${BOLD}WORKFLOW OPTIONS:${RESET}
   --no-tests          Skip writing and running tests
   --no-lint           Skip linting
@@ -647,6 +694,10 @@ ${BOLD}EXAMPLES:${RESET}
   ./ralphy.sh --init                       # Initialize config
   ./ralphy.sh "add dark mode toggle"       # Run single task
   ./ralphy.sh "fix the login bug" --cursor # Single task with Cursor
+
+  # Consensus mode (multiple engines on same task)
+  ./ralphy.sh "refactor auth system" --mode consensus --consensus-engines "claude,cursor"
+  ./ralphy.sh "fix critical bug" --consensus-engines "claude,opencode,cursor"
 
   # PRD mode (task lists)
   ./ralphy.sh                              # Run with Claude Code
@@ -719,6 +770,19 @@ parse_args() {
       --droid)
         AI_ENGINE="droid"
         shift
+        ;;
+      --mode)
+        EXECUTION_MODE="${2:-single}"
+        shift 2
+        ;;
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-}"
+        EXECUTION_MODE="consensus"
+        shift 2
+        ;;
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
         ;;
       --dry-run)
         DRY_RUN=true
