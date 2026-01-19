@@ -1,0 +1,72 @@
+## Security Fix - Critical Command Injection Vulnerabilities (CWE-78)
+
+### Summary
+Fixed critical command injection vulnerabilities in ralphy.sh that could allow arbitrary command execution through malicious task titles.
+
+### Vulnerabilities Fixed
+
+1. **YQ Command Injection in mark_task_complete_yaml() (Line 1056-1060)**
+   - Severity: CRITICAL
+   - Issue: Task titles were directly interpolated into yq filter expressions without sanitization
+   - Fix: Changed to use environment variable passing with env(TASK) pattern
+   - Impact: Prevents arbitrary YAML manipulation and code execution via malicious task titles
+
+2. **YQ Command Injection in get_parallel_group_yaml() (Line 1062-1066)**
+   - Severity: CRITICAL
+   - Issue: Same vulnerability as above in a different function
+   - Fix: Changed to use environment variable passing with env(TASK) pattern
+   - Impact: Prevents injection attacks when querying parallel groups
+
+3. **GitHub API Argument Injection in create_pull_request() (Line 1212-1246)**
+   - Severity: HIGH
+   - Issue: Task titles passed to gh pr create without sanitization
+   - Fix: Added sanitize_task_title() function and applied it before PR creation
+   - Impact: Prevents command injection through GitHub CLI arguments
+
+4. **GitHub API Argument Injection in Parallel Execution (Line 2128-2144)**
+   - Severity: HIGH
+   - Issue: Same as #3 but in the parallel agent execution path
+   - Fix: Applied sanitize_task_title() before PR creation
+   - Impact: Protects parallel execution workflow from injection attacks
+
+### Code Changes
+
+1. Added sanitize_task_title() function (Line 118-125):
+   - Removes control characters (newlines, carriage returns, null bytes)
+   - Keeps only printable characters
+   - Prevents command injection via special characters
+
+2. Updated mark_task_complete_yaml() to use TASK="$task" yq -i '(.tasks[] | select(.title == env(TASK))).completed = true'
+
+3. Updated get_parallel_group_yaml() to use TASK="$task" yq -r '.tasks[] | select(.title == env(TASK)) | .parallel_group // 0'
+
+4. Updated both PR creation paths to sanitize task titles before passing to gh command
+
+### Testing
+
+Created comprehensive security test suite (test_security_fixes_simple.sh):
+- ✓ Validates sanitize_task_title() removes dangerous characters
+- ✓ Confirms YQ functions use secure env(TASK) pattern (2 uses)
+- ✓ Verifies safe task variables in PR creation (6 uses total)
+- ✓ Checks CWE-78 documentation (5 references)
+- ✓ All 6 tests passing
+
+### Security Impact
+
+These fixes prevent attackers from:
+- Executing arbitrary yq commands through task titles
+- Injecting malicious YAML content
+- Breaking out of GitHub CLI commands
+- Executing arbitrary shell commands via newlines or special characters
+
+### References
+
+- CWE-78: Improper Neutralization of Special Elements used in an OS Command
+- Followed secure pattern from add_rule() function (line 392) which correctly uses env(RULE)
+
+### Files Modified
+
+- ralphy.sh: Core security fixes
+- test_security_fixes_simple.sh: Security test suite (NEW)
+- test_security_fixes.sh: Comprehensive test suite (NEW)
+- .ralphy/progress.txt: This file

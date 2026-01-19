@@ -115,6 +115,15 @@ slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-|-$//g' | cut -c1-50
 }
 
+# Sanitize task title to prevent command injection (CWE-78)
+# Removes newlines, null bytes, and control characters that could break commands
+sanitize_task_title() {
+  local title="$1"
+  # Remove newlines, carriage returns, null bytes, and other control characters
+  # Keep only printable ASCII characters and common unicode text
+  echo "$title" | tr -d '\000-\037' | tr -d '\177'
+}
+
 # ============================================
 # BROWNFIELD MODE (.ralphy/ configuration)
 # ============================================
@@ -1055,12 +1064,14 @@ count_completed_yaml() {
 
 mark_task_complete_yaml() {
   local task=$1
-  yq -i "(.tasks[] | select(.title == \"$task\")).completed = true" "$PRD_FILE"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -i '(.tasks[] | select(.title == env(TASK))).completed = true' "$PRD_FILE"
 }
 
 get_parallel_group_yaml() {
   local task=$1
-  yq -r ".tasks[] | select(.title == \"$task\") | .parallel_group // 0" "$PRD_FILE" 2>/dev/null || echo "0"
+  # Use env var to avoid YAML injection vulnerability (CWE-78)
+  TASK="$task" yq -r '.tasks[] | select(.title == env(TASK)) | .parallel_group // 0' "$PRD_FILE" 2>/dev/null || echo "0"
 }
 
 get_tasks_in_group_yaml() {
@@ -1202,30 +1213,34 @@ create_pull_request() {
   local branch=$1
   local task=$2
   local body="${3:-Automated PR created by Ralphy}"
-  
+
+  # Sanitize task title to prevent command injection (CWE-78)
+  local safe_task
+  safe_task=$(sanitize_task_title "$task")
+
   local draft_flag=""
   [[ "$PR_DRAFT" == true ]] && draft_flag="--draft"
-  
+
   log_info "Creating pull request for $branch..."
-  
+
   # Push branch first
   git push -u origin "$branch" 2>/dev/null || {
     log_warn "Failed to push branch $branch"
     return 1
   }
-  
-  # Create PR
+
+  # Create PR with sanitized title
   local pr_url
   pr_url=$(gh pr create \
     --base "$BASE_BRANCH" \
     --head "$branch" \
-    --title "$task" \
+    --title "$safe_task" \
     --body "$body" \
     $draft_flag 2>/dev/null) || {
     log_warn "Failed to create PR for $branch"
     return 1
   }
-  
+
   log_success "PR created: $pr_url"
   echo "$pr_url"
 }
@@ -2112,13 +2127,17 @@ Focus only on implementing: $task_name"
     
     # Create PR if requested
     if [[ "$CREATE_PR" == true ]]; then
+      # Sanitize task title to prevent command injection (CWE-78)
+      local safe_task_name
+      safe_task_name=$(sanitize_task_title "$task_name")
+
       (
         cd "$worktree_dir"
         git push -u origin "$branch_name" 2>>"$log_file" || true
         gh pr create \
           --base "$BASE_BRANCH" \
           --head "$branch_name" \
-          --title "$task_name" \
+          --title "$safe_task_name" \
           --body "Automated implementation by Ralphy (Agent $agent_num)" \
           ${PR_DRAFT:+--draft} 2>>"$log_file" || true
       )
