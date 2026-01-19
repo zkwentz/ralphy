@@ -12,6 +12,14 @@ set -euo pipefail
 # CONFIGURATION & DEFAULTS
 # ============================================
 
+# Source authentication module
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_MODULE="$SCRIPT_DIR/.ralphy/auth.sh"
+if [[ -f "$AUTH_MODULE" ]]; then
+  # shellcheck source=.ralphy/auth.sh
+  source "$AUTH_MODULE"
+fi
+
 VERSION="4.0.0"
 
 # Ralphy config directory
@@ -961,7 +969,14 @@ cleanup() {
   
   # Remove temp file
   [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
-  [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+
+  # Cleanup engine authentication artifacts using auth module
+  if command -v cleanup_engine_auth &>/dev/null; then
+    cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+  else
+    # Fallback to legacy cleanup
+    [[ -n "$CODEX_LAST_MESSAGE_FILE" ]] && rm -f "$CODEX_LAST_MESSAGE_FILE"
+  fi
   
   # Cleanup parallel worktrees
   if [[ -n "$WORKTREE_BASE" ]] && [[ -d "$WORKTREE_BASE" ]]; then
@@ -1475,50 +1490,56 @@ If ALL tasks in the PRD are complete, output <promise>COMPLETE</promise>."
 run_ai_command() {
   local prompt=$1
   local output_file=$2
-  
-  case "$AI_ENGINE" in
-    opencode)
-      # OpenCode: use 'run' command with JSON format and permissive settings
-      OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-        --format json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    cursor)
-      # Cursor agent: use --print for non-interactive, --force to allow all commands
-      agent --print --force \
-        --output-format stream-json \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    qwen)
-      # Qwen-Code: use CLI with JSON format and auto-approve tools
-      qwen --output-format stream-json \
-        --approval-mode yolo \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-    droid)
-      # Droid: use exec with stream-json output and medium autonomy for development
-      droid exec --output-format stream-json \
-        --auto medium \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    codex)
-      CODEX_LAST_MESSAGE_FILE="${output_file}.last"
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      codex exec --full-auto \
-        --json \
-        --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
-        "$prompt" > "$output_file" 2>&1 &
-      ;;
-    *)
-      # Claude Code: use existing approach
-      claude --dangerously-skip-permissions \
-        --verbose \
-        --output-format stream-json \
-        -p "$prompt" > "$output_file" 2>&1 &
-      ;;
-  esac
-  
-  ai_pid=$!
+
+  # Use new authentication module if available
+  if command -v execute_engine_command &>/dev/null; then
+    execute_engine_command "$AI_ENGINE" "$prompt" "$output_file"
+  else
+    # Fallback to legacy implementation if auth module not loaded
+    case "$AI_ENGINE" in
+      opencode)
+        # OpenCode: use 'run' command with JSON format and permissive settings
+        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+          --format json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      cursor)
+        # Cursor agent: use --print for non-interactive, --force to allow all commands
+        agent --print --force \
+          --output-format stream-json \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      qwen)
+        # Qwen-Code: use CLI with JSON format and auto-approve tools
+        qwen --output-format stream-json \
+          --approval-mode yolo \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+      droid)
+        # Droid: use exec with stream-json output and medium autonomy for development
+        droid exec --output-format stream-json \
+          --auto medium \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      codex)
+        CODEX_LAST_MESSAGE_FILE="${output_file}.last"
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        codex exec --full-auto \
+          --json \
+          --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+          "$prompt" > "$output_file" 2>&1 &
+        ;;
+      *)
+        # Claude Code: use existing approach
+        claude --dangerously-skip-permissions \
+          --verbose \
+          --output-format stream-json \
+          -p "$prompt" > "$output_file" 2>&1 &
+        ;;
+    esac
+
+    ai_pid=$!
+  fi
 }
 
 parse_ai_result() {
@@ -1837,11 +1858,18 @@ run_single_task() {
     fi
 
     rm -f "$tmpfile"
-    tmpfile=""
-    if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
-      rm -f "$CODEX_LAST_MESSAGE_FILE"
-      CODEX_LAST_MESSAGE_FILE=""
+
+    # Cleanup engine authentication artifacts using auth module
+    if command -v cleanup_engine_auth &>/dev/null; then
+      cleanup_engine_auth "$AI_ENGINE" "$tmpfile"
+    else
+      # Fallback to legacy cleanup
+      if [[ "$AI_ENGINE" == "codex" ]] && [[ -n "$CODEX_LAST_MESSAGE_FILE" ]]; then
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        CODEX_LAST_MESSAGE_FILE=""
+      fi
     fi
+    tmpfile=""
 
     # Mark task complete for GitHub issues (since AI can't do it)
     if [[ "$PRD_SOURCE" == "github" ]]; then
