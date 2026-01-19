@@ -44,6 +44,11 @@ PR_DRAFT=false
 PARALLEL=false
 MAX_PARALLEL=3
 
+# Consensus mode
+CONSENSUS_MODE=false
+CONSENSUS_ENGINES="claude,cursor"  # Default engines for consensus
+META_AGENT_ENGINE="claude"  # Engine used for meta-agent comparison
+
 # PRD source options
 PRD_SOURCE="markdown"  # markdown, yaml, github
 PRD_FILE="PRD.md"
@@ -114,6 +119,19 @@ log_debug() {
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-|-$//g' | cut -c1-50
 }
+
+# ============================================
+# SOURCE ADDITIONAL MODULES
+# ============================================
+
+# Source consensus mode and meta-agent modules if they exist
+if [[ -f "$RALPHY_DIR/modes.sh" ]]; then
+  source "$RALPHY_DIR/modes.sh"
+fi
+
+if [[ -f "$RALPHY_DIR/meta-agent.sh" ]]; then
+  source "$RALPHY_DIR/meta-agent.sh"
+fi
 
 # ============================================
 # BROWNFIELD MODE (.ralphy/ configuration)
@@ -507,6 +525,28 @@ run_brownfield_task() {
   echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo ""
 
+  # Check if consensus mode is enabled
+  if [[ "$CONSENSUS_MODE" == true ]]; then
+    log_info "Running in ${BOLD}consensus mode${RESET} with engines: $CONSENSUS_ENGINES"
+
+    # Set up worktree base for consensus mode
+    ORIGINAL_DIR=$(pwd)
+    WORKTREE_BASE="$ORIGINAL_DIR"
+    BASE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+
+    # Run consensus mode
+    if run_consensus_mode "$task" "$CONSENSUS_ENGINES"; then
+      log_task_history "$task" "completed (consensus mode)"
+      log_success "Task completed via consensus mode"
+      return 0
+    else
+      log_task_history "$task" "failed (consensus mode)"
+      log_error "Task failed in consensus mode"
+      return 1
+    fi
+  fi
+
+  # Standard single-engine mode
   local prompt
   prompt=$(build_brownfield_prompt "$task")
 
@@ -790,6 +830,24 @@ parse_args() {
       --no-commit)
         AUTO_COMMIT=false
         shift
+        ;;
+      --mode)
+        MODE_TYPE="${2:-}"
+        if [[ "$MODE_TYPE" == "consensus" ]]; then
+          CONSENSUS_MODE=true
+        else
+          log_error "Unknown mode: $MODE_TYPE (currently only 'consensus' is supported)"
+          exit 1
+        fi
+        shift 2
+        ;;
+      --consensus-engines)
+        CONSENSUS_ENGINES="${2:-claude,cursor}"
+        shift 2
+        ;;
+      --meta-agent)
+        META_AGENT_ENGINE="${2:-claude}"
+        shift 2
         ;;
       -*)
         log_error "Unknown option: $1"
