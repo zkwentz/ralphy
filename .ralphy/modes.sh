@@ -1,144 +1,9 @@
 #!/bin/bash
 
-# Multi-engine execution modes for Ralphy
-# Supports: consensus, specialization, and race modes
+# Consensus Mode Implementation
+# Runs multiple engines on the same task and compares results
 
-# ============================================
-# CONSENSUS MODE
-# ============================================
-
-# Run consensus mode with N engines on the same task
-# Returns: 0 on success, 1 on failure
-run_consensus_mode() {
-  local task_name="$1"
-  local engines_str="$2"  # Comma-separated engine names (e.g., "claude,cursor")
-  local consensus_id="consensus-$(date +%s)-$$"
-
-  # Parse engines into array
-  IFS=',' read -ra engines <<< "$engines_str"
-  local num_engines=${#engines[@]}
-
-  if [[ $num_engines -lt 2 ]]; then
-    log_error "Consensus mode requires at least 2 engines, got $num_engines"
-    return 1
-  fi
-
-  log_info "Starting consensus mode with ${num_engines} engines: ${engines[*]}"
-
-  # Create consensus workspace
-  local consensus_dir=".ralphy/consensus/$consensus_id"
-  mkdir -p "$consensus_dir"
-
-  # Store metadata
-  cat > "$consensus_dir/metadata.json" <<EOF
-{
-  "task": "$task_name",
-  "engines": [$(printf '"%s",' "${engines[@]}" | sed 's/,$//')],
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "status": "running"
-}
-EOF
-
-  # Run each engine in parallel using worktrees
-  local pids=()
-  local worktree_dirs=()
-  local branch_names=()
-  local engine_outputs=()
-  local agent_num=1
-
-  for engine in "${engines[@]}"; do
-    local engine_dir="$consensus_dir/$engine"
-    mkdir -p "$engine_dir"
-
-    local output_file="$engine_dir/output.txt"
-    local status_file="$engine_dir/status.txt"
-    local log_file="$engine_dir/log.txt"
-
-    log_info "Starting engine: $engine (agent $agent_num)"
-
-    # Run engine in background using modified parallel agent function
-    run_consensus_engine "$task_name" "$engine" "$agent_num" \
-      "$output_file" "$status_file" "$log_file" &
-
-    pids+=($!)
-    engine_outputs+=("$engine_dir")
-
-    agent_num=$((agent_num + 1))
-  done
-
-  # Wait for all engines to complete
-  log_info "Waiting for all ${num_engines} engines to complete..."
-  local all_success=true
-
-  for i in "${!pids[@]}"; do
-    local pid=${pids[$i]}
-    local engine=${engines[$i]}
-
-    if wait "$pid"; then
-      log_success "Engine $engine completed successfully"
-    else
-      log_error "Engine $engine failed"
-      all_success=false
-    fi
-  done
-
-  if [[ "$all_success" != "true" ]]; then
-    log_error "One or more engines failed"
-    echo "failed" > "$consensus_dir/metadata.json.status"
-    return 1
-  fi
-
-  # Compare solutions
-  log_info "Comparing solutions from ${num_engines} engines..."
-
-  local comparison_result
-  comparison_result=$(compare_consensus_solutions "$consensus_dir" "${engines[@]}")
-  local comparison_status=$?
-
-  if [[ $comparison_status -eq 0 ]]; then
-    log_success "Consensus reached - solutions are similar"
-
-    # Auto-accept first engine's solution (they're similar)
-    local winning_engine="${engines[0]}"
-    log_info "Auto-accepting solution from: $winning_engine"
-
-    # Apply the winning solution to main branch
-    apply_consensus_solution "$consensus_dir/$winning_engine" "$task_name"
-
-    # Update metadata
-    jq --arg winner "$winning_engine" \
-       --arg status "completed" \
-       --arg method "auto-accept" \
-       '.status = $status | .winner = $winner | .resolution_method = $method' \
-       "$consensus_dir/metadata.json" > "$consensus_dir/metadata.json.tmp"
-    mv "$consensus_dir/metadata.json.tmp" "$consensus_dir/metadata.json"
-
-    log_success "Consensus mode completed successfully"
-    return 0
-  else
-    log_warning "Solutions differ significantly - meta-agent review required"
-
-    # For this implementation (similar results), we'll still accept the first one
-    # The "different results" case would invoke the meta-agent here
-    local winning_engine="${engines[0]}"
-    log_info "Accepting solution from: $winning_engine (meta-agent not implemented yet)"
-
-    apply_consensus_solution "$consensus_dir/$winning_engine" "$task_name"
-
-    # Update metadata
-    jq --arg winner "$winning_engine" \
-       --arg status "completed" \
-       --arg method "first-accept" \
-       '.status = $status | .winner = $winner | .resolution_method = $method' \
-       "$consensus_dir/metadata.json" > "$consensus_dir/metadata.json.tmp"
-    mv "$consensus_dir/metadata.json.tmp" "$consensus_dir/metadata.json"
-
-    return 0
-  fi
-}
-
-# Run a single engine as part of consensus mode
-run_consensus_engine() {
+run_consensus_agent() {
   local task_name="$1"
   local engine="$2"
   local agent_num="$3"
@@ -149,14 +14,14 @@ run_consensus_engine() {
   echo "setting up" > "$status_file"
 
   # Log setup info
-  echo "Consensus engine $engine (agent $agent_num) starting for task: $task_name" >> "$log_file"
+  echo "Consensus Agent $agent_num ($engine) starting for task: $task_name" >> "$log_file"
   echo "ORIGINAL_DIR=$ORIGINAL_DIR" >> "$log_file"
   echo "WORKTREE_BASE=$WORKTREE_BASE" >> "$log_file"
   echo "BASE_BRANCH=$BASE_BRANCH" >> "$log_file"
 
-  # Create isolated worktree for this engine
+  # Create isolated worktree for this consensus agent
   local worktree_info
-  worktree_info=$(create_agent_worktree "$task_name-$engine" "$agent_num" 2>>"$log_file")
+  worktree_info=$(create_agent_worktree "$task_name" "$agent_num" 2>>"$log_file")
   local worktree_dir="${worktree_info%%|*}"
   local branch_name="${worktree_info##*|}"
 
@@ -166,14 +31,20 @@ run_consensus_engine() {
   if [[ ! -d "$worktree_dir" ]]; then
     echo "failed" > "$status_file"
     echo "ERROR: Worktree directory does not exist: $worktree_dir" >> "$log_file"
+    echo "0 0" > "$output_file"
     return 1
   fi
 
   echo "running" > "$status_file"
 
-  # Ensure .ralphy/ exists in worktree
-  mkdir -p "$worktree_dir/.ralphy"
-  touch "$worktree_dir/.ralphy/progress.txt"
+  # Copy PRD file to worktree from original directory
+  if [[ "$PRD_SOURCE" == "markdown" ]] || [[ "$PRD_SOURCE" == "yaml" ]]; then
+    cp "$ORIGINAL_DIR/$PRD_FILE" "$worktree_dir/" 2>/dev/null || true
+  fi
+
+  # Ensure .ralphy/ and progress.txt exist in worktree
+  mkdir -p "$worktree_dir/$RALPHY_DIR"
+  touch "$worktree_dir/$PROGRESS_FILE"
 
   # Build prompt for this specific task
   local prompt="You are working on a specific task. Focus ONLY on this task:
@@ -183,7 +54,7 @@ TASK: $task_name
 Instructions:
 1. Implement this specific task completely
 2. Write tests if appropriate
-3. Update .ralphy/progress.txt with what you did
+3. Update $PROGRESS_FILE with what you did
 4. Commit your changes with a descriptive message
 
 Do NOT modify PRD.md or mark tasks complete - that will be handled separately.
@@ -193,422 +64,330 @@ Focus only on implementing: $task_name"
   local tmpfile
   tmpfile=$(mktemp)
 
-  # Run AI engine in the worktree directory
-  local exit_code=0
+  # Run AI agent in the worktree directory with specified engine
+  local result=""
+  local success=false
+  local retry=0
 
-  case "$engine" in
-    claude)
-      (
-        cd "$worktree_dir"
-        claude --dangerously-skip-permissions \
-          -p "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-      exit_code=$?
-      ;;
-    opencode)
-      (
-        cd "$worktree_dir"
-        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-          --format json \
-          "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-      exit_code=$?
-      ;;
-    cursor)
-      (
-        cd "$worktree_dir"
-        agent --dangerously-skip-permissions \
-          -p "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-      exit_code=$?
-      ;;
-    qwen)
-      (
-        cd "$worktree_dir"
-        qwen --output-format stream-json \
-          --approval-mode yolo \
-          -p "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-      exit_code=$?
-      ;;
-    droid)
-      (
-        cd "$worktree_dir"
-        droid exec --output-format stream-json \
-          --auto medium \
-          "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-      exit_code=$?
-      ;;
-    codex)
-      (
-        cd "$worktree_dir"
-        codex exec --full-auto \
-          --json \
-          "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-      exit_code=$?
-      ;;
-    *)
-      log_error "Unknown engine: $engine"
-      echo "failed" > "$status_file"
-      return 1
-      ;;
-  esac
+  while [[ $retry -lt ${MAX_RETRIES:-3} ]]; do
+    case "$engine" in
+      opencode)
+        (
+          cd "$worktree_dir"
+          OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+            --format json \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      cursor)
+        (
+          cd "$worktree_dir"
+          agent --print --force \
+            --output-format stream-json \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      qwen)
+        (
+          cd "$worktree_dir"
+          qwen --output-format stream-json \
+            --approval-mode yolo \
+            -p "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      droid)
+        (
+          cd "$worktree_dir"
+          droid exec --output-format stream-json \
+            --auto medium \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      codex)
+        (
+          cd "$worktree_dir"
+          CODEX_LAST_MESSAGE_FILE="$tmpfile.last"
+          rm -f "$CODEX_LAST_MESSAGE_FILE"
+          codex exec --full-auto \
+            --json \
+            --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      claude|*)
+        (
+          cd "$worktree_dir"
+          claude --dangerously-skip-permissions \
+            --verbose \
+            -p "$prompt" \
+            --output-format stream-json
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+    esac
 
-  # Copy output
-  cat "$tmpfile" >> "$log_file"
+    result=$(cat "$tmpfile" 2>/dev/null || echo "")
+
+    if [[ -n "$result" ]]; then
+      local error_msg
+      if ! error_msg=$(check_for_errors "$result"); then
+        ((retry++)) || true
+        echo "API error: $error_msg (attempt $retry/${MAX_RETRIES:-3})" >> "$log_file"
+        sleep "${RETRY_DELAY:-5}"
+        continue
+      fi
+      success=true
+      break
+    fi
+
+    ((retry++)) || true
+    echo "Retry $retry/${MAX_RETRIES:-3} after empty response" >> "$log_file"
+    sleep "${RETRY_DELAY:-5}"
+  done
+
   rm -f "$tmpfile"
 
-  if [[ $exit_code -eq 0 ]]; then
-    echo "completed" > "$status_file"
+  if [[ "$success" == true ]]; then
+    # Parse tokens
+    local parsed input_tokens output_tokens
+    local CODEX_LAST_MESSAGE_FILE="${tmpfile}.last"
+    parsed=$(parse_ai_result "$result")
+    local token_data
+    token_data=$(echo "$parsed" | sed -n '/^---TOKENS---$/,$p' | tail -3)
+    input_tokens=$(echo "$token_data" | sed -n '1p')
+    output_tokens=$(echo "$token_data" | sed -n '2p')
+    [[ "$input_tokens" =~ ^[0-9]+$ ]] || input_tokens=0
+    [[ "$output_tokens" =~ ^[0-9]+$ ]] || output_tokens=0
+    rm -f "${tmpfile}.last"
 
-    # Save the worktree location for later comparison
-    echo "$worktree_dir" > "$(dirname "$output_file")/worktree.txt"
-    echo "$branch_name" > "$(dirname "$output_file")/branch.txt"
+    # Ensure at least one commit exists before marking success
+    local commit_count
+    commit_count=$(git -C "$worktree_dir" rev-list --count "$BASE_BRANCH"..HEAD 2>/dev/null || echo "0")
+    [[ "$commit_count" =~ ^[0-9]+$ ]] || commit_count=0
+    if [[ "$commit_count" -eq 0 ]]; then
+      echo "ERROR: No new commits created; treating task as failed." >> "$log_file"
+      echo "failed" > "$status_file"
+      echo "0 0" > "$output_file"
+      cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
+      return 1
+    fi
 
-    echo "Engine $engine completed successfully" >> "$log_file"
+    # Store solution for comparison
+    mkdir -p "$ORIGINAL_DIR/.ralphy/consensus"
+    local solution_dir="$ORIGINAL_DIR/.ralphy/consensus/$(echo "$task_name" | tr ' /' '__')"
+    mkdir -p "$solution_dir"
+
+    # Save git diff and commit info
+    (
+      cd "$worktree_dir"
+      git diff "$BASE_BRANCH" > "$solution_dir/${engine}_diff.patch"
+      git log "$BASE_BRANCH"..HEAD --format="%H|%s|%b" > "$solution_dir/${engine}_commits.txt"
+      git diff "$BASE_BRANCH" --stat > "$solution_dir/${engine}_stats.txt"
+    ) 2>>"$log_file"
+
+    # Write success output (include branch name for later retrieval)
+    echo "done" > "$status_file"
+    echo "$input_tokens $output_tokens $branch_name" > "$output_file"
+
+    # Keep worktree for meta-agent comparison (don't cleanup yet)
+    echo "$worktree_dir" > "$solution_dir/${engine}_worktree.txt"
+
     return 0
   else
     echo "failed" > "$status_file"
-    echo "Engine $engine failed with exit code $exit_code" >> "$log_file"
+    echo "0 0" > "$output_file"
+    cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
     return 1
   fi
 }
 
-# Compare solutions from multiple engines
-# Returns: 0 if similar, 1 if different
-compare_consensus_solutions() {
-  local consensus_dir="$1"
-  shift
-  local engines=("$@")
+run_consensus_mode() {
+  local task_name="$1"
+  local engines_str="${2:-claude,cursor}"  # Default to claude and cursor
 
-  log_info "Comparing solutions from: ${engines[*]}"
+  # Split engines string into array
+  IFS=',' read -ra ENGINES <<< "$engines_str"
+  local num_engines="${#ENGINES[@]}"
 
-  # Get worktree paths for each engine
-  local worktrees=()
-  for engine in "${engines[@]}"; do
-    local worktree_file="$consensus_dir/$engine/worktree.txt"
-    if [[ -f "$worktree_file" ]]; then
-      worktrees+=("$(cat "$worktree_file")")
-    else
-      log_error "No worktree file found for engine: $engine"
-      return 1
+  if [[ "$num_engines" -lt 2 ]]; then
+    log_error "Consensus mode requires at least 2 engines (provided: $num_engines)"
+    return 1
+  fi
+
+  log_info "Running ${BOLD}consensus mode${RESET} with ${num_engines} engines: ${ENGINES[*]}"
+
+  # Create temp directory for tracking agents
+  local temp_dir="$ORIGINAL_DIR/.ralphy/temp"
+  mkdir -p "$temp_dir"
+
+  # Arrays to track agent PIDs and files
+  local agent_pids=()
+  local output_files=()
+  local status_files=()
+  local log_files=()
+  local branch_names=()
+
+  # Launch all consensus agents in parallel
+  local agent_num=1
+  for engine in "${ENGINES[@]}"; do
+    local output_file="$temp_dir/consensus_agent_${agent_num}_output.txt"
+    local status_file="$temp_dir/consensus_agent_${agent_num}_status.txt"
+    local log_file="$temp_dir/consensus_agent_${agent_num}_log.txt"
+
+    echo "pending" > "$status_file"
+    echo "0 0" > "$output_file"
+    > "$log_file"
+
+    # Run agent in background
+    run_consensus_agent "$task_name" "$engine" "$agent_num" "$output_file" "$status_file" "$log_file" &
+    local pid=$!
+
+    agent_pids+=("$pid")
+    output_files+=("$output_file")
+    status_files+=("$status_file")
+    log_files+=("$log_file")
+
+    log_info "  Launched $engine (agent $agent_num, PID $pid)"
+    ((agent_num++))
+  done
+
+  # Monitor progress with spinner
+  log_info "Waiting for all ${num_engines} consensus agents to complete..."
+  local all_done=false
+  local check_interval=2
+
+  while [[ "$all_done" == false ]]; do
+    all_done=true
+    local status_summary=""
+
+    for i in "${!status_files[@]}"; do
+      local status=$(cat "${status_files[$i]}" 2>/dev/null || echo "pending")
+      status_summary+=" [${ENGINES[$i]}:$status]"
+
+      if [[ "$status" != "done" ]] && [[ "$status" != "failed" ]]; then
+        all_done=false
+      fi
+    done
+
+    if [[ "$all_done" == false ]]; then
+      echo -ne "\r  Status:$status_summary"
+      sleep "$check_interval"
     fi
   done
 
-  # Compare the git diffs from each worktree
-  local diffs=()
-  for worktree in "${worktrees[@]}"; do
-    local diff_file=$(mktemp)
-    (
-      cd "$worktree"
-      git diff --unified=0 HEAD 2>/dev/null || echo "No changes"
-    ) > "$diff_file"
-    diffs+=("$diff_file")
+  echo ""  # New line after status updates
+
+  # Wait for all agents to complete
+  for pid in "${agent_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
   done
 
-  # Simple comparison: check if diffs are identical or very similar
-  # For now, we'll consider them similar if the number of changed lines is close
-  local base_diff="${diffs[0]}"
-  local base_lines=$(wc -l < "$base_diff" 2>/dev/null || echo "0")
+  # Collect results
+  local successful_engines=()
+  local failed_engines=()
+  local total_input_tokens=0
+  local total_output_tokens=0
 
-  local all_similar=true
-  for i in $(seq 1 $((${#diffs[@]} - 1))); do
-    local other_diff="${diffs[$i]}"
-    local other_lines=$(wc -l < "$other_diff" 2>/dev/null || echo "0")
+  for i in "${!status_files[@]}"; do
+    local status=$(cat "${status_files[$i]}" 2>/dev/null || echo "failed")
+    local engine="${ENGINES[$i]}"
 
-    # Calculate difference ratio
-    local max_lines=$((base_lines > other_lines ? base_lines : other_lines))
-    local min_lines=$((base_lines < other_lines ? base_lines : other_lines))
+    if [[ "$status" == "done" ]]; then
+      successful_engines+=("$engine")
+      local output=$(cat "${output_files[$i]}" 2>/dev/null || echo "0 0")
+      local input_tokens=$(echo "$output" | awk '{print $1}')
+      local output_tokens=$(echo "$output" | awk '{print $2}')
+      local branch_name=$(echo "$output" | awk '{print $3}')
 
-    if [[ $max_lines -gt 0 ]]; then
-      local similarity=$((min_lines * 100 / max_lines))
+      [[ "$input_tokens" =~ ^[0-9]+$ ]] || input_tokens=0
+      [[ "$output_tokens" =~ ^[0-9]+$ ]] || output_tokens=0
 
-      log_info "Similarity between ${engines[0]} and ${engines[$i]}: ${similarity}%"
+      total_input_tokens=$((total_input_tokens + input_tokens))
+      total_output_tokens=$((total_output_tokens + output_tokens))
+      branch_names+=("$branch_name")
 
-      # Consider similar if >80% similarity in line count
-      if [[ $similarity -lt 80 ]]; then
-        all_similar=false
-        break
+      log_info "  ✓ $engine completed successfully (branch: $branch_name)"
+    else
+      failed_engines+=("$engine")
+      log_error "  ✗ $engine failed"
+    fi
+  done
+
+  # Check if we have at least 2 successful results to compare
+  if [[ "${#successful_engines[@]}" -lt 2 ]]; then
+    log_error "Consensus mode failed: only ${#successful_engines[@]} engine(s) succeeded (need at least 2)"
+    return 1
+  fi
+
+  log_info "Consensus agents completed: ${#successful_engines[@]} succeeded, ${#failed_engines[@]} failed"
+  log_info "Total tokens: input=$total_input_tokens, output=$total_output_tokens"
+
+  # Compare solutions using meta-agent
+  log_info "Comparing solutions from: ${successful_engines[*]}"
+
+  local solution_dir="$ORIGINAL_DIR/.ralphy/consensus/$(echo "$task_name" | tr ' /' '__')"
+  local meta_result
+  meta_result=$(run_meta_agent_comparison "$task_name" "$solution_dir" "${successful_engines[@]}")
+
+  local chosen_engine=$(echo "$meta_result" | grep "^CHOSEN:" | cut -d':' -f2 | xargs)
+  local reasoning=$(echo "$meta_result" | grep -A100 "^REASONING:" | tail -n +2)
+
+  if [[ -z "$chosen_engine" ]]; then
+    log_error "Meta-agent failed to choose a solution"
+    return 1
+  fi
+
+  log_info "Meta-agent selected: ${BOLD}$chosen_engine${RESET}"
+  log_info "Reasoning: $reasoning"
+
+  # Apply the chosen solution
+  local chosen_branch=""
+  for i in "${!successful_engines[@]}"; do
+    if [[ "${successful_engines[$i]}" == "$chosen_engine" ]]; then
+      chosen_branch="${branch_names[$i]}"
+      break
+    fi
+  done
+
+  if [[ -z "$chosen_branch" ]]; then
+    log_error "Could not find branch for chosen engine: $chosen_engine"
+    return 1
+  fi
+
+  log_info "Applying solution from branch: $chosen_branch"
+
+  # Merge chosen branch into current branch
+  (
+    cd "$ORIGINAL_DIR"
+    git merge "$chosen_branch" --no-edit -m "Consensus mode: Apply solution from $chosen_engine
+
+Selected by meta-agent from ${#successful_engines[@]} solutions.
+
+Reasoning: $reasoning"
+  ) || {
+    log_error "Failed to merge chosen solution"
+    return 1
+  }
+
+  # Cleanup all consensus worktrees
+  for engine in "${successful_engines[@]}"; do
+    local worktree_file="$solution_dir/${engine}_worktree.txt"
+    if [[ -f "$worktree_file" ]]; then
+      local worktree_path=$(cat "$worktree_file")
+      if [[ -d "$worktree_path" ]]; then
+        local branch_to_cleanup=""
+        for i in "${!successful_engines[@]}"; do
+          if [[ "${successful_engines[$i]}" == "$engine" ]]; then
+            branch_to_cleanup="${branch_names[$i]}"
+            break
+          fi
+        done
+        if [[ -n "$branch_to_cleanup" ]]; then
+          cleanup_agent_worktree "$worktree_path" "$branch_to_cleanup" "${log_files[$i]}"
+        fi
       fi
     fi
   done
 
-  # Cleanup temp diff files
-  for diff_file in "${diffs[@]}"; do
-    rm -f "$diff_file"
-  done
-
-  if [[ "$all_similar" == "true" ]]; then
-    echo "Solutions are similar"
-    return 0
-  else
-    echo "Solutions differ significantly"
-    return 1
-  fi
-}
-
-# Apply the consensus solution to the main working directory
-apply_consensus_solution() {
-  local solution_dir="$1"
-  local task_name="$2"
-
-  local worktree_file="$solution_dir/worktree.txt"
-  local branch_file="$solution_dir/branch.txt"
-
-  if [[ ! -f "$worktree_file" ]] || [[ ! -f "$branch_file" ]]; then
-    log_error "Missing worktree or branch files in solution directory"
-    return 1
-  fi
-
-  local worktree_dir=$(cat "$worktree_file")
-  local branch_name=$(cat "$branch_file")
-
-  log_info "Applying solution from branch: $branch_name"
-
-  # Merge the consensus branch into current branch
-  (
-    cd "$ORIGINAL_DIR"
-
-    # Merge the consensus branch
-    git merge --no-ff -m "Consensus solution for: $task_name" "$branch_name" 2>&1 || {
-      log_error "Failed to merge consensus solution"
-      return 1
-    }
-  )
-
-  local merge_status=$?
-
-  # Cleanup worktree
-  if [[ -d "$worktree_dir" ]]; then
-    (
-      cd "$ORIGINAL_DIR"
-      git worktree remove -f "$worktree_dir" 2>/dev/null || true
-    )
-  fi
-
-  return $merge_status
-}
-
-# ============================================
-# SPECIALIZATION MODE
-# ============================================
-
-# Run specialization mode - route task to appropriate engine based on rules
-# Returns: 0 on success, 1 on failure
-run_specialization_mode() {
-  local task_name="$1"
-  local config_file="${2:-.ralphy/config.yaml}"
-
-  log_info "Starting specialization mode for task: $task_name"
-
-  # Match task against specialization rules
-  local selected_engine
-  local matched_pattern
-  local match_info
-  match_info=$(match_specialization_rule "$task_name" "$config_file")
-
-  if [[ -n "$match_info" ]]; then
-    # Parse match info (format: "engine|pattern")
-    selected_engine="${match_info%%|*}"
-    matched_pattern="${match_info##*|}"
-
-    log_success "Matched pattern: '$matched_pattern' → Engine: $selected_engine"
-  else
-    # No matching rule - fallback to default engine
-    selected_engine=$(get_default_engine "$config_file")
-    log_info "No matching specialization rule - using default engine: $selected_engine"
-    matched_pattern="(no match - default)"
-  fi
-
-  # Create specialization tracking directory
-  local specialization_id="spec-$(date +%s)-$$"
-  local spec_dir=".ralphy/specialization/$specialization_id"
-  mkdir -p "$spec_dir"
-
-  # Store metadata
-  cat > "$spec_dir/metadata.json" <<EOF
-{
-  "task": "$task_name",
-  "selected_engine": "$selected_engine",
-  "matched_pattern": "$matched_pattern",
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "status": "running"
-}
-EOF
-
-  # Execute task with selected engine
-  log_info "Executing task with engine: $selected_engine"
-
-  # Run the engine (using brownfield single-task execution)
-  local exit_code=0
-  run_single_engine_task "$task_name" "$selected_engine" "$spec_dir"
-  exit_code=$?
-
-  # Update metadata with result
-  if [[ $exit_code -eq 0 ]]; then
-    jq '.status = "completed" | .success = true' \
-      "$spec_dir/metadata.json" > "$spec_dir/metadata.json.tmp"
-    mv "$spec_dir/metadata.json.tmp" "$spec_dir/metadata.json"
-
-    log_success "Specialization mode completed successfully with $selected_engine"
-    return 0
-  else
-    jq '.status = "failed" | .success = false' \
-      "$spec_dir/metadata.json" > "$spec_dir/metadata.json.tmp"
-    mv "$spec_dir/metadata.json.tmp" "$spec_dir/metadata.json"
-
-    log_error "Specialization mode failed with $selected_engine"
-    return 1
-  fi
-}
-
-# Match task description against specialization rules
-# Returns: "engine|pattern" if matched, empty string if no match
-match_specialization_rule() {
-  local task_desc="$1"
-  local config_file="${2:-.ralphy/config.yaml}"
-
-  # Check if config file exists
-  if [[ ! -f "$config_file" ]]; then
-    echo ""
-    return 1
-  fi
-
-  # Check if yq is available for YAML parsing
-  if ! command -v yq &> /dev/null; then
-    # Fallback: no yq available, return empty
-    echo ""
-    return 1
-  fi
-
-  # Parse specialization rules from config
-  local num_rules
-  num_rules=$(yq eval '.engines.specialization_rules | length' "$config_file" 2>/dev/null || echo "0")
-
-  if [[ "$num_rules" == "0" ]] || [[ "$num_rules" == "null" ]]; then
-    echo ""
-    return 1
-  fi
-
-  # Iterate through rules and match patterns
-  for i in $(seq 0 $((num_rules - 1))); do
-    local pattern
-    local engines
-
-    pattern=$(yq eval ".engines.specialization_rules[$i].pattern" "$config_file" 2>/dev/null)
-    engines=$(yq eval ".engines.specialization_rules[$i].engines[0]" "$config_file" 2>/dev/null)
-
-    if [[ "$pattern" == "null" ]] || [[ "$engines" == "null" ]]; then
-      continue
-    fi
-
-    # Case-insensitive pattern matching
-    if echo "$task_desc" | grep -qiE "$pattern"; then
-      echo "$engines|$pattern"
-      return 0
-    fi
-  done
-
-  # No match found
-  echo ""
-  return 1
-}
-
-# Get the default engine from config or use fallback
-get_default_engine() {
-  local config_file="${1:-.ralphy/config.yaml}"
-
-  # Try to read from config
-  if [[ -f "$config_file" ]] && command -v yq &> /dev/null; then
-    local default_engine
-    default_engine=$(yq eval '.engines.meta_agent.engine' "$config_file" 2>/dev/null)
-
-    if [[ -n "$default_engine" ]] && [[ "$default_engine" != "null" ]]; then
-      echo "$default_engine"
-      return 0
-    fi
-  fi
-
-  # Fallback to environment variable or hardcoded default
-  echo "${AI_ENGINE:-claude}"
-}
-
-# Run a single engine task (used by specialization mode)
-run_single_engine_task() {
-  local task_name="$1"
-  local engine="$2"
-  local spec_dir="$3"
-
-  local log_file="$spec_dir/execution.log"
-
-  # Build prompt
-  local prompt="You are working on a specific task. Focus ONLY on this task:
-
-TASK: $task_name
-
-Instructions:
-1. Implement this specific task completely
-2. Write tests if appropriate
-3. Update .ralphy/progress.txt with what you did
-4. Commit your changes with a descriptive message
-
-Do NOT modify PRD.md or mark tasks complete - that will be handled separately.
-Focus only on implementing: $task_name"
-
-  # Run the engine
-  local exit_code=0
-
-  case "$engine" in
-    claude)
-      claude --dangerously-skip-permissions \
-        -p "$prompt" > "$log_file" 2>&1
-      exit_code=$?
-      ;;
-    opencode)
-      OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-        --format json \
-        "$prompt" > "$log_file" 2>&1
-      exit_code=$?
-      ;;
-    cursor)
-      agent --dangerously-skip-permissions \
-        -p "$prompt" > "$log_file" 2>&1
-      exit_code=$?
-      ;;
-    qwen)
-      qwen --output-format stream-json \
-        --approval-mode yolo \
-        -p "$prompt" > "$log_file" 2>&1
-      exit_code=$?
-      ;;
-    droid)
-      droid exec --output-format stream-json \
-        --auto medium \
-        "$prompt" > "$log_file" 2>&1
-      exit_code=$?
-      ;;
-    codex)
-      codex exec --full-auto \
-        --json \
-        "$prompt" > "$log_file" 2>&1
-      exit_code=$?
-      ;;
-    *)
-      log_error "Unknown engine: $engine"
-      return 1
-      ;;
-  esac
-
-  return $exit_code
-}
-
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-
-# Slugify a string for use in branch names
-slugify() {
-  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//' | cut -c1-50
+  log_info "Consensus mode completed successfully"
+  return 0
 }
