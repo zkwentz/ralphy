@@ -615,8 +615,8 @@ Running multiple engines increases costs. Strategies:
 - [x] Race mode with all failures
 - [x] Meta-agent decision parsing
 - [x] Metrics recording and adaptive selection
-- [ ] Cost limit enforcement
-- [ ] Validation gate failures
+- [x] Cost limit enforcement
+- [x] Validation gate failures
 
 ### 11. Migration Path
 
