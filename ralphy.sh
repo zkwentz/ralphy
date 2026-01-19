@@ -44,6 +44,12 @@ PR_DRAFT=false
 PARALLEL=false
 MAX_PARALLEL=3
 
+# Race mode execution
+RACE_MODE=false
+RACE_ENGINES=()
+RACE_VALIDATION_REQUIRED=true
+RACE_TIMEOUT_MULTIPLIER=1.5
+
 # PRD source options
 PRD_SOURCE="markdown"  # markdown, yaml, github
 PRD_FILE="PRD.md"
@@ -725,6 +731,22 @@ parse_args() {
         ;;
       --max-parallel)
         MAX_PARALLEL="${2:-3}"
+        shift 2
+        ;;
+      --race)
+        RACE_MODE=true
+        shift
+        ;;
+      --race-engines)
+        IFS=',' read -ra RACE_ENGINES <<< "${2:-}"
+        shift 2
+        ;;
+      --no-validation)
+        RACE_VALIDATION_REQUIRED=false
+        shift
+        ;;
+      --race-timeout)
+        RACE_TIMEOUT_MULTIPLIER="${2:-1.5}"
         shift 2
         ;;
       --branch-per-task)
@@ -2140,6 +2162,432 @@ Focus only on implementing: $task_name"
   fi
 }
 
+# ============================================
+# RACE MODE EXECUTION
+# ============================================
+
+validate_race_solution() {
+  local worktree_dir="$1"
+  local task_name="$2"
+  local log_file="$3"
+
+  echo "Validating solution in $worktree_dir" >> "$log_file"
+
+  # Check if commits were made
+  local commit_count
+  commit_count=$(git -C "$worktree_dir" rev-list --count "$BASE_BRANCH"..HEAD 2>/dev/null || echo "0")
+  [[ "$commit_count" =~ ^[0-9]+$ ]] || commit_count=0
+
+  if [[ "$commit_count" -eq 0 ]]; then
+    echo "Validation FAILED: No commits made" >> "$log_file"
+    return 1
+  fi
+
+  # Run tests if required and not skipped
+  if [[ "$RACE_VALIDATION_REQUIRED" == true ]] && [[ "$SKIP_TESTS" == false ]]; then
+    if [[ -f "$worktree_dir/package.json" ]] && grep -q '"test"' "$worktree_dir/package.json" 2>/dev/null; then
+      echo "Running tests for validation..." >> "$log_file"
+      if ! (cd "$worktree_dir" && npm test 2>&1) >> "$log_file"; then
+        echo "Validation FAILED: Tests failed" >> "$log_file"
+        return 1
+      fi
+    fi
+  fi
+
+  # Run lint if required and not skipped
+  if [[ "$RACE_VALIDATION_REQUIRED" == true ]] && [[ "$SKIP_LINT" == false ]]; then
+    if [[ -f "$worktree_dir/package.json" ]] && grep -q '"lint"' "$worktree_dir/package.json" 2>/dev/null; then
+      echo "Running lint for validation..." >> "$log_file"
+      if ! (cd "$worktree_dir" && npm run lint 2>&1) >> "$log_file"; then
+        echo "Validation FAILED: Lint failed" >> "$log_file"
+        return 1
+      fi
+    fi
+  fi
+
+  echo "Validation PASSED" >> "$log_file"
+  return 0
+}
+
+run_race_agent() {
+  local task_name="$1"
+  local engine="$2"
+  local agent_num="$3"
+  local output_file="$4"
+  local status_file="$5"
+  local log_file="$6"
+
+  echo "setting up" > "$status_file"
+
+  # Log setup info
+  echo "Race Agent $agent_num ($engine) starting for task: $task_name" >> "$log_file"
+  echo "Start time: $(date +%s.%N)" >> "$log_file"
+
+  # Create isolated worktree for this agent
+  local worktree_info
+  worktree_info=$(create_agent_worktree "$task_name" "$agent_num" 2>>"$log_file")
+  local worktree_dir="${worktree_info%%|*}"
+  local branch_name="${worktree_info##*|}"
+
+  echo "Worktree dir: $worktree_dir" >> "$log_file"
+  echo "Branch name: $branch_name" >> "$log_file"
+
+  if [[ ! -d "$worktree_dir" ]]; then
+    echo "failed" > "$status_file"
+    echo "ERROR: Worktree directory does not exist: $worktree_dir" >> "$log_file"
+    echo "0 0" > "$output_file"
+    return 1
+  fi
+
+  echo "running" > "$status_file"
+
+  # Copy PRD file to worktree from original directory
+  if [[ "$PRD_SOURCE" == "markdown" ]] || [[ "$PRD_SOURCE" == "yaml" ]]; then
+    cp "$ORIGINAL_DIR/$PRD_FILE" "$worktree_dir/" 2>/dev/null || true
+  fi
+
+  # Ensure .ralphy/ and progress.txt exist in worktree
+  mkdir -p "$worktree_dir/$RALPHY_DIR"
+  touch "$worktree_dir/$PROGRESS_FILE"
+
+  # Build prompt for this specific task
+  local prompt="You are working on a specific task. Focus ONLY on this task:
+
+TASK: $task_name
+
+Instructions:
+1. Implement this specific task completely
+2. Write tests if appropriate
+3. Update $PROGRESS_FILE with what you did
+4. Commit your changes with a descriptive message
+
+Do NOT modify PRD.md or mark tasks complete - that will be handled separately.
+Focus only on implementing: $task_name"
+
+  # Temp file for AI output
+  local tmpfile
+  tmpfile=$(mktemp)
+
+  # Run AI agent in the worktree directory with the specified engine
+  local result=""
+  local success=false
+
+  case "$engine" in
+    opencode)
+      (
+        cd "$worktree_dir"
+        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+          --format json \
+          "$prompt"
+      ) > "$tmpfile" 2>>"$log_file"
+      ;;
+    cursor)
+      (
+        cd "$worktree_dir"
+        agent --print --force \
+          --output-format stream-json \
+          "$prompt"
+      ) > "$tmpfile" 2>>"$log_file"
+      ;;
+    qwen)
+      (
+        cd "$worktree_dir"
+        qwen --output-format stream-json \
+          --approval-mode yolo \
+          -p "$prompt"
+      ) > "$tmpfile" 2>>"$log_file"
+      ;;
+    droid)
+      (
+        cd "$worktree_dir"
+        droid exec --output-format stream-json \
+          --auto medium \
+          "$prompt"
+      ) > "$tmpfile" 2>>"$log_file"
+      ;;
+    codex)
+      (
+        cd "$worktree_dir"
+        CODEX_LAST_MESSAGE_FILE="$tmpfile.last"
+        rm -f "$CODEX_LAST_MESSAGE_FILE"
+        codex exec --full-auto \
+          --json \
+          --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+          "$prompt"
+      ) > "$tmpfile" 2>>"$log_file"
+      ;;
+    *)
+      (
+        cd "$worktree_dir"
+        claude --dangerously-skip-permissions \
+          --verbose \
+          -p "$prompt" \
+          --output-format stream-json
+      ) > "$tmpfile" 2>>"$log_file"
+      ;;
+  esac
+
+  result=$(cat "$tmpfile" 2>/dev/null || echo "")
+  echo "Completion time: $(date +%s.%N)" >> "$log_file"
+
+  if [[ -n "$result" ]]; then
+    local error_msg
+    if ! error_msg=$(check_for_errors "$result"); then
+      echo "API error: $error_msg" >> "$log_file"
+      echo "failed" > "$status_file"
+      echo "0 0" > "$output_file"
+      rm -f "$tmpfile" "${tmpfile}.last"
+      cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
+      return 1
+    fi
+    success=true
+  fi
+
+  rm -f "$tmpfile"
+
+  if [[ "$success" == true ]]; then
+    # Parse tokens
+    local parsed input_tokens output_tokens
+    local CODEX_LAST_MESSAGE_FILE="${tmpfile}.last"
+    parsed=$(parse_ai_result "$result")
+    local token_data
+    token_data=$(echo "$parsed" | sed -n '/^---TOKENS---$/,$p' | tail -3)
+    input_tokens=$(echo "$token_data" | sed -n '1p')
+    output_tokens=$(echo "$token_data" | sed -n '2p')
+    [[ "$input_tokens" =~ ^[0-9]+$ ]] || input_tokens=0
+    [[ "$output_tokens" =~ ^[0-9]+$ ]] || output_tokens=0
+    rm -f "${tmpfile}.last"
+
+    # Mark as validating
+    echo "validating" > "$status_file"
+
+    # Validate the solution
+    if validate_race_solution "$worktree_dir" "$task_name" "$log_file"; then
+      echo "done" > "$status_file"
+      echo "$input_tokens $output_tokens $branch_name $worktree_dir" > "$output_file"
+      return 0
+    else
+      echo "validation_failed" > "$status_file"
+      echo "0 0" > "$output_file"
+      cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
+      return 1
+    fi
+  else
+    echo "failed" > "$status_file"
+    echo "0 0" > "$output_file"
+    cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
+    return 1
+  fi
+}
+
+run_race_mode() {
+  local task_name="$1"
+
+  log_info "Starting ${BOLD}Race Mode${RESET} for task: $task_name"
+
+  # Default to all available engines if not specified
+  if [[ ${#RACE_ENGINES[@]} -eq 0 ]]; then
+    RACE_ENGINES=("claude" "opencode" "cursor")
+  fi
+
+  # Filter to only available engines
+  local available_engines=()
+  for engine in "${RACE_ENGINES[@]}"; do
+    case "$engine" in
+      claude) command -v claude &>/dev/null && available_engines+=("claude") ;;
+      opencode) command -v opencode &>/dev/null && available_engines+=("opencode") ;;
+      cursor) command -v agent &>/dev/null && available_engines+=("cursor") ;;
+      codex) command -v codex &>/dev/null && available_engines+=("codex") ;;
+      qwen) command -v qwen &>/dev/null && available_engines+=("qwen") ;;
+      droid) command -v droid &>/dev/null && available_engines+=("droid") ;;
+    esac
+  done
+
+  if [[ ${#available_engines[@]} -eq 0 ]]; then
+    log_error "No race engines available. Install at least one AI engine."
+    return 1
+  fi
+
+  log_info "Racing ${#available_engines[@]} engines: ${available_engines[*]}"
+
+  # Setup worktree base
+  ORIGINAL_DIR=$(pwd)
+  WORKTREE_BASE=$(mktemp -d)
+
+  # Get current branch as base
+  BASE_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  ORIGINAL_BASE_BRANCH="$BASE_BRANCH"
+
+  # Create temp files for each racing agent
+  local -a race_pids=()
+  local -a race_output_files=()
+  local -a race_status_files=()
+  local -a race_log_files=()
+  local -a race_engines_list=()
+  local -a race_start_times=()
+
+  # Start all racing agents
+  local agent_num=1
+  for engine in "${available_engines[@]}"; do
+    local output_file=$(mktemp)
+    local status_file=$(mktemp)
+    local log_file=$(mktemp)
+
+    race_output_files+=("$output_file")
+    race_status_files+=("$status_file")
+    race_log_files+=("$log_file")
+    race_engines_list+=("$engine")
+    race_start_times+=("$(date +%s.%N)")
+
+    run_race_agent "$task_name" "$engine" "$agent_num" "$output_file" "$status_file" "$log_file" &
+    race_pids+=($!)
+
+    log_info "Started ${engine} (Agent $agent_num, PID: ${race_pids[$((agent_num-1))]})"
+    ((agent_num++))
+  done
+
+  # Monitor for first completion
+  local winner_found=false
+  local winner_engine=""
+  local winner_branch=""
+  local winner_worktree=""
+  local winner_tokens=""
+  local winner_agent_num=0
+  local start_time=$(date +%s)
+  local timeout=$((start_time + $(echo "$RACE_TIMEOUT_MULTIPLIER * 600" | bc | cut -d. -f1)))
+
+  log_info "Monitoring race progress (timeout: ${RACE_TIMEOUT_MULTIPLIER}x standard)..."
+
+  while [[ "$winner_found" == false ]]; do
+    local current_time=$(date +%s)
+
+    # Check for timeout
+    if [[ $current_time -gt $timeout ]]; then
+      log_warn "Race timeout reached. Killing all agents."
+      for pid in "${race_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+      done
+      break
+    fi
+
+    # Check each agent's status
+    for i in "${!race_pids[@]}"; do
+      local pid="${race_pids[$i]}"
+      local status_file="${race_status_files[$i]}"
+      local output_file="${race_output_files[$i]}"
+      local engine="${race_engines_list[$i]}"
+      local agent_num=$((i + 1))
+
+      if [[ -f "$status_file" ]]; then
+        local status=$(cat "$status_file")
+
+        case "$status" in
+          done)
+            # Winner found!
+            winner_found=true
+            winner_engine="$engine"
+            winner_agent_num=$agent_num
+
+            # Parse output
+            local output=$(cat "$output_file")
+            winner_tokens=$(echo "$output" | cut -d' ' -f1,2)
+            winner_branch=$(echo "$output" | cut -d' ' -f3)
+            winner_worktree=$(echo "$output" | cut -d' ' -f4)
+
+            local end_time=$(date +%s.%N)
+            local elapsed=$(echo "$end_time - ${race_start_times[$i]}" | bc)
+
+            log_success "Winner: ${BOLD}$winner_engine${RESET} (Agent $winner_agent_num) in ${elapsed}s"
+
+            # Kill all other agents
+            for j in "${!race_pids[@]}"; do
+              if [[ $j -ne $i ]]; then
+                local other_pid="${race_pids[$j]}"
+                local other_engine="${race_engines_list[$j]}"
+                kill "$other_pid" 2>/dev/null || true
+                log_info "Stopped ${other_engine} (Agent $((j + 1)))"
+              fi
+            done
+            break 2
+            ;;
+          validation_failed)
+            # This agent failed validation, continue with others
+            log_warn "$engine (Agent $agent_num) completed but failed validation"
+            ;;
+          failed)
+            log_warn "$engine (Agent $agent_num) failed"
+            ;;
+        esac
+      fi
+    done
+
+    # Check if all agents have finished (all failed)
+    local all_done=true
+    for i in "${!race_pids[@]}"; do
+      if ps -p "${race_pids[$i]}" > /dev/null 2>&1; then
+        all_done=false
+        break
+      fi
+    done
+
+    if [[ "$all_done" == true ]] && [[ "$winner_found" == false ]]; then
+      log_error "All race agents failed or finished without a valid winner"
+      break
+    fi
+
+    sleep 0.3
+  done
+
+  # Cleanup temp files and losing worktrees
+  for i in "${!race_pids[@]}"; do
+    if [[ $i -ne $((winner_agent_num - 1)) ]]; then
+      # Clean up losing agent files
+      rm -f "${race_output_files[$i]}" "${race_status_files[$i]}" "${race_log_files[$i]}"
+    fi
+  done
+
+  if [[ "$winner_found" == true ]]; then
+    # Integrate winner's changes
+    log_info "Integrating winner's changes from branch: $winner_branch"
+
+    # Merge winner's branch to current branch
+    if git merge --no-edit "$winner_branch" 2>/dev/null; then
+      log_success "Winner's changes merged successfully"
+
+      # Create PR if requested
+      if [[ "$CREATE_PR" == true ]]; then
+        git push -u origin "$winner_branch" 2>/dev/null || true
+        gh pr create \
+          --base "$BASE_BRANCH" \
+          --head "$winner_branch" \
+          --title "$task_name" \
+          --body "Automated implementation by Ralphy Race Mode (Winner: $winner_engine)" \
+          ${PR_DRAFT:+--draft} 2>/dev/null || true
+      fi
+    else
+      log_error "Failed to merge winner's changes"
+      return 1
+    fi
+
+    # Cleanup winner's worktree
+    if [[ -n "$winner_worktree" ]] && [[ -d "$winner_worktree" ]]; then
+      cleanup_agent_worktree "$winner_worktree" "$winner_branch" "${race_log_files[$((winner_agent_num - 1))]}"
+    fi
+
+    # Cleanup temp directory
+    rm -rf "$WORKTREE_BASE"
+
+    # Clean up winner's temp files
+    rm -f "${race_output_files[$((winner_agent_num - 1))]}" "${race_status_files[$((winner_agent_num - 1))]}" "${race_log_files[$((winner_agent_num - 1))]}"
+
+    return 0
+  else
+    log_error "Race mode failed - no winner found"
+    rm -rf "$WORKTREE_BASE"
+    return 1
+  fi
+}
+
 run_parallel_tasks() {
   log_info "Running ${BOLD}$MAX_PARALLEL parallel agents${RESET} (each in isolated worktree)..."
   
@@ -2769,7 +3217,29 @@ main() {
     trap cleanup EXIT
     trap 'exit 130' INT TERM HUP
 
-    # Check basic requirements (AI engine, git)
+    # Check basic requirements (git)
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+      log_error "Not a git repository"
+      exit 1
+    fi
+
+    # Handle race mode for single task
+    if [[ "$RACE_MODE" == true ]]; then
+      echo "${BOLD}============================================${RESET}"
+      echo "${BOLD}Ralphy${RESET} - Race Mode"
+      echo "Task: $SINGLE_TASK"
+      if [[ ${#RACE_ENGINES[@]} -gt 0 ]]; then
+        echo "Engines: ${RACE_ENGINES[*]}"
+      else
+        echo "Engines: Auto-detect available"
+      fi
+      echo "${BOLD}============================================${RESET}"
+
+      run_race_mode "$SINGLE_TASK"
+      exit $?
+    fi
+
+    # Check basic requirements (AI engine for non-race mode)
     case "$AI_ENGINE" in
       claude) command -v claude &>/dev/null || { log_error "Claude Code CLI not found"; exit 1; } ;;
       opencode) command -v opencode &>/dev/null || { log_error "OpenCode CLI not found"; exit 1; } ;;
@@ -2778,11 +3248,6 @@ main() {
       qwen) command -v qwen &>/dev/null || { log_error "Qwen-Code CLI not found"; exit 1; } ;;
       droid) command -v droid &>/dev/null || { log_error "Factory Droid CLI not found"; exit 1; } ;;
     esac
-
-    if ! git rev-parse --git-dir >/dev/null 2>&1; then
-      log_error "Not a git repository"
-      exit 1
-    fi
 
     # Show brownfield banner
     echo "${BOLD}============================================${RESET}"

@@ -1,0 +1,96 @@
+## Race Mode with Early Winner - Implementation Complete
+
+### Overview
+Implemented race mode functionality for Ralphy that allows multiple AI engines to compete on the same task, with the first engine to complete successfully being declared the winner. This optimizes speed for straightforward tasks.
+
+### Features Implemented
+
+1. **CLI Flags**
+   - `--race`: Enable race mode
+   - `--race-engines <engines>`: Comma-separated list of engines to race (e.g., "claude,opencode,cursor")
+   - `--no-validation`: Skip validation of solutions
+   - `--race-timeout <multiplier>`: Set timeout multiplier (default: 1.5x)
+
+2. **Core Functions**
+   - `validate_race_solution()`: Validates a solution by checking:
+     - Commit count (must have at least one commit)
+     - Test execution (if validation enabled and tests exist)
+     - Lint checks (if validation enabled and lint exists)
+
+   - `run_race_agent()`: Runs a single racing agent with specified engine:
+     - Creates isolated git worktree
+     - Executes AI engine with task prompt
+     - Validates solution upon completion
+     - Returns early with status (done/validation_failed/failed)
+
+   - `run_race_mode()`: Orchestrates the race:
+     - Detects available engines from specified list (or defaults to claude/opencode/cursor)
+     - Spawns all racing agents in parallel
+     - Monitors for first completion in real-time (0.3s polling)
+     - Declares winner and kills remaining agents immediately
+     - Merges winner's changes to current branch
+     - Cleans up losing agents' worktrees and branches
+
+3. **Key Behaviors**
+   - **Early Winner Detection**: Continuously monitors agent status files, stops immediately when first valid solution is found
+   - **Automatic Cleanup**: Kills all non-winning agent processes and cleans up their worktrees
+   - **Timeout Handling**: Configurable timeout multiplier (default 1.5x = 15 minutes)
+   - **Validation**: Optional validation with tests and linting before declaring winner
+   - **Multi-Engine Support**: Works with claude, opencode, cursor, codex, qwen, droid
+
+4. **Integration**
+   - Integrated into main() function to route `--race` flag in single-task mode
+   - Maintains backward compatibility with existing parallel mode
+   - Uses existing worktree infrastructure for isolation
+
+### Usage Examples
+
+```bash
+# Race with default engines (claude, opencode, cursor)
+./ralphy.sh --race "Add user authentication feature"
+
+# Race with specific engines
+./ralphy.sh --race --race-engines "claude,qwen,droid" "Fix login bug"
+
+# Race without validation (faster)
+./ralphy.sh --race --no-validation "Update README"
+
+# Race with custom timeout
+./ralphy.sh --race --race-timeout 2.0 "Implement complex feature"
+```
+
+### Testing
+Created comprehensive test suite (`test_race_mode.sh`) that verifies:
+- CLI flag parsing
+- Function definitions
+- Main routing logic
+- Validation logic (commits, tests, lint)
+- Early winner detection and cleanup
+- Timeout handling
+- Multiple engine support
+
+All tests pass successfully.
+
+### Technical Details
+
+**Race Workflow:**
+1. Parse CLI flags and detect available engines
+2. Create temporary worktree base directory
+3. Spawn all racing agents in parallel (each in isolated worktree)
+4. Monitor status files every 0.3 seconds
+5. When first agent completes:
+   - Validate solution (commits, tests, lint)
+   - If valid: declare winner, kill others, merge changes
+   - If invalid: continue monitoring other agents
+6. Handle timeout if no winner found
+7. Clean up all temp files and losing worktrees
+
+**Status Flow:**
+- `setting up` → `running` → `validating` → `done` (winner)
+- Or: `validation_failed` / `failed` (continue with other agents)
+
+### Files Modified
+- `ralphy.sh`: Added race mode variables, CLI flags, functions, and routing (lines 47-51, 736-751, 2165-2589, 3226-3240)
+
+### Files Created
+- `test_race_mode.sh`: Comprehensive test suite for race mode functionality
