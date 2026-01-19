@@ -1,403 +1,204 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# ============================================
-# Meta-Agent Decision Resolution
-# ============================================
-# Functions for meta-agent conflict resolution and decision parsing
-# Part of Ralphy's multi-agent engine system
+# Meta-Agent Implementation
+# Compares multiple AI solutions and selects the best one
 
-# Note: We don't use 'set -euo pipefail' globally here to allow
-# more flexible regex matching and error handling within functions
+run_meta_agent_comparison() {
+  local task_name="$1"
+  local solution_dir="$2"
+  shift 2
+  local engines=("$@")
 
-# ============================================
-# DECISION PARSING
-# ============================================
+  local num_solutions="${#engines[@]}"
 
-# Parse meta-agent decision from output
-# Expected format:
-#   DECISION: [select|merge]
-#   CHOSEN: [solution number OR "merged"]
-#   REASONING: [explain your choice]
-#
-#   If DECISION is "merge", also expect:
-#   MERGED_SOLUTION:
-#   ```
-#   [merged code]
-#   ```
-#
-# Args:
-#   $1 - Path to meta-agent output file
-#
-# Returns:
-#   Echoes JSON object with parsed decision:
-#   {
-#     "decision": "select|merge",
-#     "chosen": "1|2|merged",
-#     "reasoning": "explanation text",
-#     "merged_solution": "code content (if merge)"
-#   }
-#
-# Exit codes:
-#   0 - Success
-#   1 - File not found or invalid format
-parse_meta_decision() {
-  local output_file="$1"
-
-  if [[ ! -f "$output_file" ]]; then
-    echo "{\"error\": \"Output file not found: $output_file\"}" >&2
+  if [[ "$num_solutions" -lt 2 ]]; then
+    echo "ERROR: Need at least 2 solutions to compare"
     return 1
   fi
 
-  local decision=""
-  local chosen=""
-  local reasoning=""
-  local merged_solution=""
-  local in_merged_block=false
-  local in_code_block=false
-  local code_buffer=""
-  local reading_reasoning=false
+  # Build comparison prompt
+  local prompt="You are a meta-agent reviewing multiple AI-generated solutions to the same task. Your job is to objectively analyze and select the best solution.
 
-  # Helper function to trim whitespace without xargs (to avoid quote issues)
-  trim() {
-    local var="$1"
-    # Remove leading whitespace
-    var="${var#"${var%%[![:space:]]*}"}"
-    # Remove trailing whitespace
-    var="${var%"${var##*[![:space:]]}"}"
-    printf '%s' "$var"
-  }
+TASK: $task_name
 
-  # Read file line by line
-  while IFS= read -r line; do
-    # Extract DECISION field
-    if [[ "$line" =~ ^[[:space:]]*DECISION:[[:space:]]*(.+)$ ]]; then
-      local matched="${BASH_REMATCH[1]:-}"
-      decision=$(trim "$matched")
-      decision=$(echo "$decision" | tr '[:upper:]' '[:lower:]')  # lowercase
-      reading_reasoning=false
+I have received $num_solutions different solutions from different AI engines. Please review each solution carefully.
+
+"
+
+  # Add each solution to the prompt
+  local solution_num=1
+  for engine in "${engines[@]}"; do
+    local diff_file="$solution_dir/${engine}_diff.patch"
+    local commits_file="$solution_dir/${engine}_commits.txt"
+    local stats_file="$solution_dir/${engine}_stats.txt"
+
+    if [[ ! -f "$diff_file" ]]; then
+      echo "ERROR: Missing diff file for $engine"
       continue
-    fi
-
-    # Extract CHOSEN field
-    if [[ "$line" =~ ^[[:space:]]*CHOSEN:[[:space:]]*(.+)$ ]]; then
-      local matched="${BASH_REMATCH[1]:-}"
-      chosen=$(trim "$matched")
-      # Extract just the number or "merged"
-      if [[ "$chosen" =~ ([0-9]+|merged) ]]; then
-        chosen="${BASH_REMATCH[1]:-}"
-      fi
-      reading_reasoning=false
-      continue
-    fi
-
-    # Extract REASONING field (may be multiline)
-    if [[ "$line" =~ ^[[:space:]]*REASONING:[[:space:]]*(.+)$ ]]; then
-      local matched="${BASH_REMATCH[1]:-}"
-      reasoning=$(trim "$matched")
-      reading_reasoning=true
-      continue
-    fi
-
-    # Detect MERGED_SOLUTION section
-    if [[ "$line" =~ ^[[:space:]]*MERGED_SOLUTION:[[:space:]]*$ ]]; then
-      in_merged_block=true
-      reading_reasoning=false
-      continue
-    fi
-
-    # Continue reading reasoning if we're in that section
-    if [[ "$reading_reasoning" == true ]] && [[ -n "$line" ]] && [[ ! "$line" =~ ^[[:space:]]*$ ]]; then
-      # Stop if we hit another field marker
-      if [[ "$line" =~ ^[[:space:]]*(DECISION|CHOSEN|MERGED_SOLUTION): ]]; then
-        reading_reasoning=false
-      else
-        # Append to reasoning
-        if [[ -n "$reasoning" ]]; then
-          reasoning+=" "
-        fi
-        reasoning+=$(trim "$line")
-      fi
-    fi
-
-    # Handle merged solution code block
-    if [[ "$in_merged_block" == true ]]; then
-      # Start of code block
-      if [[ "$line" =~ ^[[:space:]]*\`\`\`[[:space:]]*[a-z]* ]]; then
-        if [[ "$in_code_block" == false ]]; then
-          in_code_block=true
-          code_buffer=""
-        else
-          # End of code block (closing backticks)
-          in_code_block=false
-          merged_solution="$code_buffer"
-          in_merged_block=false
-        fi
-        continue
-      fi
-
-      # Collect code lines
-      if [[ "$in_code_block" == true ]]; then
-        if [[ -n "$code_buffer" ]]; then
-          code_buffer+=$'\n'
-        fi
-        code_buffer+="$line"
-      fi
-    fi
-
-  done < "$output_file"
-
-  # Validate required fields
-  if [[ -z "$decision" ]]; then
-    echo "{\"error\": \"Missing DECISION field in meta-agent output\"}" >&2
-    return 1
-  fi
-
-  if [[ -z "$chosen" ]]; then
-    echo "{\"error\": \"Missing CHOSEN field in meta-agent output\"}" >&2
-    return 1
-  fi
-
-  # Validate decision type
-  if [[ "$decision" != "select" && "$decision" != "merge" ]]; then
-    echo "{\"error\": \"Invalid DECISION value: $decision (must be 'select' or 'merge')\"}" >&2
-    return 1
-  fi
-
-  # If decision is merge, ensure we have merged solution
-  if [[ "$decision" == "merge" && -z "$merged_solution" ]]; then
-    echo "{\"error\": \"DECISION is 'merge' but no MERGED_SOLUTION found\"}" >&2
-    return 1
-  fi
-
-  # Build JSON output using printf and simple string replacement
-  # Escape special characters for JSON
-  escape_json() {
-    local str="$1"
-    # Escape backslashes and quotes
-    str="${str//\\/\\\\}"
-    str="${str//\"/\\\"}"
-    # Replace newlines with \n (literal backslash-n)
-    str="${str//$'\n'/\\n}"
-    printf '%s' "$str"
-  }
-
-  local escaped_reasoning
-  local escaped_solution
-
-  escaped_reasoning=$(escape_json "$reasoning")
-
-  local json_output="{"
-  json_output+="\"decision\": \"$decision\""
-  json_output+=", \"chosen\": \"$chosen\""
-  json_output+=", \"reasoning\": \"$escaped_reasoning\""
-
-  # Add merged solution if present
-  if [[ -n "$merged_solution" ]]; then
-    escaped_solution=$(escape_json "$merged_solution")
-    json_output+=", \"merged_solution\": \"$escaped_solution\""
-  fi
-
-  json_output+="}"
-
-  echo "$json_output"
-  return 0
-}
-
-# ============================================
-# PROMPT PREPARATION
-# ============================================
-
-# Prepare meta-agent prompt comparing multiple solutions
-# Args:
-#   $1 - Task description
-#   $@ - Array of solution directory paths
-#
-# Returns:
-#   Echoes formatted prompt string
-prepare_meta_prompt() {
-  local task_desc="$1"
-  shift
-  local solutions=("$@")
-  local n=${#solutions[@]}
-
-  local prompt="You are reviewing $n different solutions to the following task:
-
-TASK: $task_desc
-
-"
-
-  # Add each solution
-  local i=1
-  for solution_dir in "${solutions[@]}"; do
-    local engine_name=$(basename "$solution_dir")
-    prompt+="SOLUTION $i (from $engine_name):
-"
-
-    # Read solution files (git diff or changed files)
-    if [[ -d "$solution_dir" ]]; then
-      # Get git diff for this worktree
-      local diff_output
-      if diff_output=$(cd "$solution_dir" && git diff HEAD 2>/dev/null); then
-        if [[ -n "$diff_output" ]]; then
-          prompt+="$diff_output
-"
-        else
-          prompt+="(No changes detected)
-"
-        fi
-      else
-        prompt+="(Error reading solution)
-"
-      fi
     fi
 
     prompt+="
+═══════════════════════════════════════════════════════════════
+SOLUTION $solution_num (from $engine):
+═══════════════════════════════════════════════════════════════
+
+COMMIT MESSAGES:
+$(cat "$commits_file" 2>/dev/null || echo "No commit info available")
+
+CHANGE STATISTICS:
+$(cat "$stats_file" 2>/dev/null || echo "No stats available")
+
+CODE CHANGES (diff):
+\`\`\`diff
+$(cat "$diff_file")
+\`\`\`
 
 "
-    ((i++))
+    ((solution_num++))
   done
 
-  # Add instructions
-  prompt+="INSTRUCTIONS:
-1. Analyze each solution for:
-   - Correctness
-   - Code quality
-   - Adherence to project rules
-   - Performance implications
-   - Edge case handling
+  prompt+="
+═══════════════════════════════════════════════════════════════
+ANALYSIS INSTRUCTIONS:
+═══════════════════════════════════════════════════════════════
 
-2. Either:
-   a) Select the best single solution
-   b) Merge the best parts of multiple solutions
+Please analyze each solution based on:
 
-3. Provide your decision in this format:
-   DECISION: [select|merge]
-   CHOSEN: [solution number OR \"merged\"]
-   REASONING: [explain your choice]
+1. **Correctness**: Does it properly implement the requested task?
+2. **Code Quality**: Is the code clean, maintainable, and well-structured?
+3. **Completeness**: Does it fully address all aspects of the task?
+4. **Testing**: Does it include appropriate tests?
+5. **Best Practices**: Does it follow coding standards and conventions?
+6. **Edge Cases**: Does it handle edge cases and error conditions?
+7. **Documentation**: Are changes well-documented (commits, comments)?
+8. **Scope**: Does it stay focused on the task without unnecessary changes?
 
-   If DECISION is \"merge\", provide:
-   MERGED_SOLUTION:
-   \`\`\`
-   [your merged code here]
-   \`\`\`
+Compare the solutions objectively. The best solution might come from any engine.
 
-Be objective. The best solution might not be from the most expensive engine."
+IMPORTANT: Provide your decision in this EXACT format:
 
-  echo "$prompt"
-}
+DECISION: [This should be 'select' - merging is not yet supported]
+CHOSEN: [engine name - must be one of: ${engines[*]}]
+REASONING:
+[Provide a clear, detailed explanation of why you chose this solution. Compare the key differences between the solutions and explain what made the chosen solution superior.]
 
-# ============================================
-# META-AGENT EXECUTION
-# ============================================
+Make sure to use the EXACT format above. The CHOSEN field must contain only the engine name.
+"
 
-# Run meta-agent to resolve conflicts between solutions
-# Args:
-#   $1 - Task description
-#   $@ - Array of solution directory paths
-#
-# Returns:
-#   Echoes path to decision file
-#   Exit code 0 on success, 1 on failure
-run_meta_agent() {
-  local task_desc="$1"
-  shift
-  local solutions=("$@")
-
+  # Run meta-agent (use Claude by default)
   local meta_engine="${META_AGENT_ENGINE:-claude}"
-  local output_file=".ralphy/meta-agent-decision.json"
-  local prompt
+  local tmpfile
+  tmpfile=$(mktemp)
 
-  # Prepare prompt
-  prompt=$(prepare_meta_prompt "$task_desc" "${solutions[@]}")
-
-  # Create output directory if needed
-  mkdir -p "$(dirname "$output_file")"
-
-  # Run meta-agent based on engine type
   case "$meta_engine" in
-    claude)
-      if command -v claude &>/dev/null; then
-        echo "$prompt" | claude --dangerously-skip-permissions \
-          --output-format stream-json \
-          > "$output_file" 2>&1
-      else
-        echo "{\"error\": \"Claude CLI not found\"}" > "$output_file"
-        return 1
-      fi
+    claude|*)
+      claude --dangerously-skip-permissions \
+        -p "$prompt" \
+        --output-format stream-json > "$tmpfile" 2>&1
       ;;
-
-    opencode)
-      if command -v opencode &>/dev/null; then
-        echo "$prompt" | opencode --output-format stream-json \
-          > "$output_file" 2>&1
-      else
-        echo "{\"error\": \"OpenCode CLI not found\"}" > "$output_file"
-        return 1
-      fi
-      ;;
-
-    cursor)
-      if command -v cursor &>/dev/null; then
-        echo "$prompt" | cursor --output-format stream-json \
-          > "$output_file" 2>&1
-      else
-        echo "{\"error\": \"Cursor CLI not found\"}" > "$output_file"
-        return 1
-      fi
-      ;;
-
-    *)
-      echo "{\"error\": \"Unknown meta-agent engine: $meta_engine\"}" > "$output_file"
-      return 1
-      ;;
+    # Could add other engines here if needed
   esac
 
-  # Parse and validate decision
-  local decision_json
-  if decision_json=$(parse_meta_decision "$output_file"); then
-    echo "$decision_json" > "$output_file"
-    echo "$output_file"
+  # Parse the meta-agent output
+  local result
+  result=$(parse_ai_result "$(cat "$tmpfile")")
+  rm -f "$tmpfile"
+
+  # Extract decision from result
+  local chosen_engine=""
+  local reasoning=""
+
+  # Look for the CHOSEN: line in the output
+  if echo "$result" | grep -q "^CHOSEN:"; then
+    chosen_engine=$(echo "$result" | grep "^CHOSEN:" | head -1 | cut -d':' -f2- | xargs)
+  elif echo "$result" | grep -iq "CHOSEN:"; then
+    # Case-insensitive search as fallback
+    chosen_engine=$(echo "$result" | grep -i "^CHOSEN:" | head -1 | cut -d':' -f2- | xargs)
+  fi
+
+  # Extract reasoning
+  if echo "$result" | grep -q "^REASONING:"; then
+    reasoning=$(echo "$result" | sed -n '/^REASONING:/,${p}' | tail -n +2)
+  elif echo "$result" | grep -iq "REASONING:"; then
+    reasoning=$(echo "$result" | sed -n '/^[Rr][Ee][Aa][Ss][Oo][Nn][Ii][Nn][Gg]:/,${p}' | tail -n +2)
+  fi
+
+  # Validate chosen engine is in the list
+  local valid_choice=false
+  for engine in "${engines[@]}"; do
+    if [[ "$chosen_engine" == "$engine" ]]; then
+      valid_choice=true
+      break
+    fi
+  done
+
+  if [[ "$valid_choice" == false ]]; then
+    # Try to find engine name in the result text
+    for engine in "${engines[@]}"; do
+      if echo "$result" | grep -qi "$engine"; then
+        chosen_engine="$engine"
+        valid_choice=true
+        break
+      fi
+    done
+  fi
+
+  # Save meta-agent decision
+  local decision_file="$solution_dir/meta-decision.txt"
+  cat > "$decision_file" <<EOF
+Task: $task_name
+Engines Compared: ${engines[*]}
+Chosen: $chosen_engine
+Valid: $valid_choice
+
+Full Meta-Agent Response:
+$result
+EOF
+
+  # Return the decision
+  if [[ "$valid_choice" == true ]]; then
+    echo "CHOSEN:$chosen_engine"
+    echo "REASONING:$reasoning"
     return 0
   else
+    echo "ERROR: Meta-agent did not provide a valid choice. Response saved to $decision_file"
+    # Default to first successful engine as fallback
+    echo "CHOSEN:${engines[0]}"
+    echo "REASONING:Meta-agent failed to choose; using first available solution (${engines[0]}) as fallback."
     return 1
   fi
 }
 
-# ============================================
-# SOLUTION MERGING
-# ============================================
+compare_solution_similarity() {
+  local solution1="$1"
+  local solution2="$2"
 
-# Apply merged solution to target directory
-# Args:
-#   $1 - Merged solution code
-#   $2 - Target directory
-#
-# Returns:
-#   Exit code 0 on success, 1 on failure
-merge_solutions() {
-  local merged_solution="$1"
-  local target_dir="$2"
+  # Simple similarity check based on diff size
+  local size1=$(wc -l < "$solution1" 2>/dev/null || echo "0")
+  local size2=$(wc -l < "$solution2" 2>/dev/null || echo "0")
 
-  # This is a placeholder for solution merging logic
-  # In practice, this would:
-  # 1. Parse file paths from diff/code blocks
-  # 2. Apply changes to target directory
-  # 3. Validate the merged result
+  # If sizes are very different, solutions are different
+  if [[ "$size1" -eq 0 ]] || [[ "$size2" -eq 0 ]]; then
+    echo "0.0"
+    return 0
+  fi
 
-  # For now, just log the action
-  echo "Applying merged solution to $target_dir"
+  local diff_ratio=$((size1 * 100 / size2))
+  if [[ "$diff_ratio" -lt 80 ]] || [[ "$diff_ratio" -gt 120 ]]; then
+    echo "0.5"
+    return 0
+  fi
 
-  # TODO: Implement actual merge logic
-  # This might involve:
-  # - Creating/updating files
-  # - Running git apply with patches
-  # - Handling conflicts
+  # Check for similar content (basic comparison)
+  local diff_lines
+  diff_lines=$(diff "$solution1" "$solution2" 2>/dev/null | wc -l)
 
-  return 0
+  # Calculate similarity score (0.0 to 1.0)
+  local similarity=$((100 - (diff_lines * 100 / size1)))
+  if [[ "$similarity" -lt 0 ]]; then
+    similarity=0
+  fi
+
+  # Convert to decimal
+  echo "0.$similarity"
 }
-
-# Export functions for use in ralphy.sh
-export -f parse_meta_decision
-export -f prepare_meta_prompt
-export -f run_meta_agent
-export -f merge_solutions
