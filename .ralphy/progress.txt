@@ -1,0 +1,68 @@
+# Ralphy Progress Log
+
+## 2026-01-18 - Cost Limit Enforcement Implementation
+
+Implemented comprehensive cost limit enforcement for the Ralphy multi-agent system as specified in MultiAgentPlan.md (lines 583-588).
+
+### Features Added:
+
+1. **Configuration Variables (ralphy.sh:48-55)**
+   - `MAX_COST_PER_TASK`: Maximum USD per task (0 = unlimited)
+   - `MAX_COST_PER_SESSION`: Maximum USD per session (0 = unlimited)
+   - `COST_WARN_THRESHOLD`: Warning threshold percentage (default 0.75)
+   - `task_start_cost`: Tracks cost at task start for per-task limit calculation
+
+2. **Cost Management Functions (ralphy.sh:1690-1790)**
+   - `load_cost_limits()`: Loads cost limits from .ralphy/config.yaml
+   - `get_current_session_cost()`: Returns current session cost (actual from OpenCode or estimated)
+   - `check_cost_limits()`: Validates costs against limits and warns when approaching thresholds
+
+3. **Cost Checking Integration**
+   - Cost limits loaded at startup in `check_requirements()` (ralphy.sh:825)
+   - Task start cost tracked at beginning of each task (ralphy.sh:1806-1808)
+   - Cost limits checked after each AI response (ralphy.sh:1960-1973)
+   - Task stops if per-task limit exceeded
+   - Session stops if per-session limit exceeded
+   - Warning logged when cost reaches warn_threshold percentage
+
+4. **Configuration Schema (ralphy.sh:273-290)**
+   - Added `cost_controls` section to config.yaml template
+   - Includes examples and documentation
+   - Displayed in `--config` output
+
+5. **Cost Display Enhancement**
+   - `show_ralphy_config()` now displays cost control settings (ralphy.sh:388-401)
+
+### How It Works:
+
+**Per-Task Limits:**
+- Records total cost at task start
+- After each API call, calculates task cost = current_cost - task_start_cost
+- Warns when task cost reaches 75% (or configured threshold) of limit
+- Stops task if limit exceeded
+
+**Per-Session Limits:**
+- Tracks cumulative cost across all tasks
+- Warns when session cost reaches threshold percentage of limit
+- Stops entire session if limit exceeded
+
+**Cost Sources:**
+- Uses actual cost from OpenCode when available
+- Falls back to estimated cost based on token usage (Claude pricing)
+- Supports duration tracking for Cursor (stored separately)
+
+### Testing:
+- Syntax validation passed
+- Config initialization verified with cost_controls section
+- Cost calculation tested: 1M input + 500k output = $10.50
+- Limit detection tested: correctly identifies when limits exceeded
+- Warning threshold tested: alerts at 75% of limit
+
+### Configuration Example:
+```yaml
+cost_controls:
+  max_per_task: 5.00      # Stop task if cost exceeds $5
+  max_per_session: 50.00  # Stop session if total exceeds $50
+  warn_threshold: 0.75    # Warn at 75% of limit
+```
+

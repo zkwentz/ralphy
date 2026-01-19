@@ -50,6 +50,12 @@ PRD_FILE="PRD.md"
 GITHUB_REPO=""
 GITHUB_LABEL=""
 
+# Cost control options
+MAX_COST_PER_TASK=0     # 0 = unlimited
+MAX_COST_PER_SESSION=0  # 0 = unlimited
+COST_WARN_THRESHOLD=0.75  # Warn at 75% of limit
+task_start_cost=0       # Track cost at task start for per-task limit
+
 # Colors (detect if terminal supports colors)
 if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
   RED=$(tput setaf 1)
@@ -270,6 +276,16 @@ boundaries:
     # - "src/legacy/**"
     # - "migrations/**"
     # - "*.lock"
+
+# Cost controls - prevent runaway costs
+cost_controls:
+  max_per_task: 0      # Maximum USD per task (0 = unlimited)
+  max_per_session: 0   # Maximum USD per session (0 = unlimited)
+  warn_threshold: 0.75 # Warn when reaching this % of limit (default 75%)
+  # Examples:
+  # max_per_task: 5.00
+  # max_per_session: 50.00
+  # warn_threshold: 0.75
 EOF
 
   # Create progress.txt
@@ -367,6 +383,26 @@ show_ralphy_config() {
       done
       echo ""
     fi
+
+    # Cost controls
+    local max_task max_session warn_thresh
+    max_task=$(yq -r '.cost_controls.max_per_task // 0' "$CONFIG_FILE" 2>/dev/null)
+    max_session=$(yq -r '.cost_controls.max_per_session // 0' "$CONFIG_FILE" 2>/dev/null)
+    warn_thresh=$(yq -r '.cost_controls.warn_threshold // 0.75' "$CONFIG_FILE" 2>/dev/null)
+
+    echo "${BOLD}Cost Controls:${RESET}"
+    if [[ "$max_task" != "0" ]]; then
+      echo "  Max per task:    \$$max_task"
+    else
+      echo "  Max per task:    ${DIM}unlimited${RESET}"
+    fi
+    if [[ "$max_session" != "0" ]]; then
+      echo "  Max per session: \$$max_session"
+    else
+      echo "  Max per session: ${DIM}unlimited${RESET}"
+    fi
+    echo "  Warn threshold:  ${warn_thresh}"
+    echo ""
   else
     # Fallback: just show the file
     cat "$CONFIG_FILE"
@@ -815,6 +851,9 @@ parse_args() {
 
 check_requirements() {
   local missing=()
+
+  # Load cost limits from config if available
+  load_cost_limits
 
   # Check for PRD source
   case "$PRD_SOURCE" in
@@ -1666,18 +1705,126 @@ check_for_errors() {
 }
 
 # ============================================
-# COST CALCULATION
+# COST CALCULATION & ENFORCEMENT
 # ============================================
 
 calculate_cost() {
   local input=$1
   local output=$2
-  
+
   if command -v bc &>/dev/null; then
     echo "scale=4; ($input * 0.000003) + ($output * 0.000015)" | bc
   else
     echo "N/A"
   fi
+}
+
+# Load cost limits from config.yaml
+load_cost_limits() {
+  [[ ! -f "$CONFIG_FILE" ]] && return
+
+  if command -v yq &>/dev/null; then
+    local max_task
+    local max_session
+    local warn_thresh
+
+    max_task=$(yq -r '.cost_controls.max_per_task // 0' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    max_session=$(yq -r '.cost_controls.max_per_session // 0' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    warn_thresh=$(yq -r '.cost_controls.warn_threshold // 0.75' "$CONFIG_FILE" 2>/dev/null || echo "0.75")
+
+    # Validate numeric values
+    if [[ "$max_task" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      MAX_COST_PER_TASK="$max_task"
+    fi
+    if [[ "$max_session" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      MAX_COST_PER_SESSION="$max_session"
+    fi
+    if [[ "$warn_thresh" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      COST_WARN_THRESHOLD="$warn_thresh"
+    fi
+  fi
+}
+
+# Get current session cost (estimated or actual)
+get_current_session_cost() {
+  if [[ "$AI_ENGINE" == "opencode" ]] && command -v bc &>/dev/null; then
+    # Use actual cost if available
+    local has_actual_cost
+    has_actual_cost=$(echo "$total_actual_cost > 0" | bc 2>/dev/null || echo "0")
+    if [[ "$has_actual_cost" == "1" ]]; then
+      echo "$total_actual_cost"
+      return
+    fi
+  fi
+
+  # Fallback to estimated cost
+  if command -v bc &>/dev/null; then
+    calculate_cost "$total_input_tokens" "$total_output_tokens"
+  else
+    echo "0"
+  fi
+}
+
+# Check if cost limits are exceeded
+check_cost_limits() {
+  local check_type="${1:-session}"  # "session" or "task"
+
+  # Skip if bc not available or limits not set
+  command -v bc &>/dev/null || return 0
+
+  local current_cost
+  current_cost=$(get_current_session_cost)
+
+  # Validate cost is a number
+  [[ "$current_cost" =~ ^[0-9]+(\.[0-9]+)?$ ]] || current_cost=0
+
+  if [[ "$check_type" == "task" ]] && [[ "$MAX_COST_PER_TASK" != "0" ]]; then
+    # Check per-task limit
+    local task_cost
+    task_cost=$(echo "scale=6; $current_cost - $task_start_cost" | bc 2>/dev/null || echo "0")
+
+    # Check if exceeded
+    local exceeded
+    exceeded=$(echo "$task_cost >= $MAX_COST_PER_TASK" | bc 2>/dev/null || echo "0")
+    if [[ "$exceeded" == "1" ]]; then
+      log_error "Task cost limit exceeded: \$${task_cost} >= \$${MAX_COST_PER_TASK}"
+      return 1
+    fi
+
+    # Check if approaching limit (warn threshold)
+    local warn_level
+    warn_level=$(echo "scale=6; $MAX_COST_PER_TASK * $COST_WARN_THRESHOLD" | bc 2>/dev/null || echo "0")
+    local approaching
+    approaching=$(echo "$task_cost >= $warn_level" | bc 2>/dev/null || echo "0")
+    if [[ "$approaching" == "1" ]]; then
+      local percent
+      percent=$(echo "scale=0; ($task_cost / $MAX_COST_PER_TASK) * 100" | bc 2>/dev/null || echo "0")
+      log_warn "Task cost at ${percent}% of limit: \$${task_cost} / \$${MAX_COST_PER_TASK}"
+    fi
+  fi
+
+  if [[ "$check_type" == "session" ]] && [[ "$MAX_COST_PER_SESSION" != "0" ]]; then
+    # Check session limit
+    local exceeded
+    exceeded=$(echo "$current_cost >= $MAX_COST_PER_SESSION" | bc 2>/dev/null || echo "0")
+    if [[ "$exceeded" == "1" ]]; then
+      log_error "Session cost limit exceeded: \$${current_cost} >= \$${MAX_COST_PER_SESSION}"
+      return 1
+    fi
+
+    # Check if approaching limit (warn threshold)
+    local warn_level
+    warn_level=$(echo "scale=6; $MAX_COST_PER_SESSION * $COST_WARN_THRESHOLD" | bc 2>/dev/null || echo "0")
+    local approaching
+    approaching=$(echo "$current_cost >= $warn_level" | bc 2>/dev/null || echo "0")
+    if [[ "$approaching" == "1" ]]; then
+      local percent
+      percent=$(echo "scale=0; ($current_cost / $MAX_COST_PER_SESSION) * 100" | bc 2>/dev/null || echo "0")
+      log_warn "Session cost at ${percent}% of limit: \$${current_cost} / \$${MAX_COST_PER_SESSION}"
+    fi
+  fi
+
+  return 0
 }
 
 # ============================================
@@ -1687,12 +1834,17 @@ calculate_cost() {
 run_single_task() {
   local task_name="${1:-}"
   local task_num="${2:-$iteration}"
-  
+
   retry_count=0
-  
+
+  # Record cost at task start for per-task limit tracking
+  if command -v bc &>/dev/null; then
+    task_start_cost=$(get_current_session_cost 2>/dev/null || echo "0")
+  fi
+
   echo ""
   echo "${BOLD}>>> Task $task_num${RESET}"
-  
+
   local remaining completed
   remaining=$(count_remaining_tasks | tr -d '[:space:]')
   completed=$(count_completed_tasks | tr -d '[:space:]')
@@ -1708,12 +1860,12 @@ run_single_task() {
   else
     current_task=$(get_next_task)
   fi
-  
+
   if [[ -z "$current_task" ]]; then
     log_info "No more tasks found"
     return 2
   fi
-  
+
   current_step="Thinking"
 
   # Create branch if needed
@@ -1823,7 +1975,7 @@ run_single_task() {
     # Update totals
     total_input_tokens=$((total_input_tokens + input_tokens))
     total_output_tokens=$((total_output_tokens + output_tokens))
-    
+
     # Track actual cost for OpenCode, or duration for Cursor
     if [[ -n "$actual_cost" ]]; then
       if [[ "$actual_cost" == duration:* ]]; then
@@ -1834,6 +1986,23 @@ run_single_task() {
         # OpenCode cost tracking
         total_actual_cost=$(echo "scale=6; $total_actual_cost + $actual_cost" | bc 2>/dev/null || echo "$total_actual_cost")
       fi
+    fi
+
+    # Check cost limits after updating totals
+    if ! check_cost_limits "task"; then
+      log_error "Stopping task due to cost limit"
+      rm -f "$tmpfile"
+      tmpfile=""
+      return_to_base_branch
+      return 1
+    fi
+    if ! check_cost_limits "session"; then
+      log_error "Stopping session due to cost limit"
+      rm -f "$tmpfile"
+      tmpfile=""
+      return_to_base_branch
+      show_summary
+      exit 1
     fi
 
     rm -f "$tmpfile"
