@@ -1,0 +1,101 @@
+## Consensus Mode with 2 Engines (Similar Results) - Implementation Complete
+
+### Summary
+Implemented consensus mode functionality that allows Ralphy to run multiple AI engines in parallel on the same task and intelligently select or merge the best solution.
+
+### Features Implemented
+
+1. **Core Infrastructure**
+   - Created `.ralphy/modes.sh` module with consensus mode orchestration
+   - Created `.ralphy/meta-agent.sh` module for solution comparison and meta-agent integration
+   - Added multi-engine execution variables to ralphy.sh
+
+2. **Consensus Mode Logic**
+   - `run_consensus_mode()`: Orchestrates multiple engines on the same task
+   - `run_consensus_engine()`: Executes a single engine as part of consensus
+   - `compare_consensus_solutions()`: Compares solutions using diff similarity (>80% threshold)
+   - `apply_consensus_solution()`: Merges the selected solution into the main branch
+
+3. **Git Worktree Isolation**
+   - Each engine runs in its own isolated git worktree
+   - Prevents conflicts between concurrent engine executions
+   - Clean merge of winning solution back to main branch
+
+4. **CLI Integration**
+   - Added `--mode [single|consensus|specialization|race]` flag
+   - Added `--consensus-engines "engine1,engine2,..."` flag
+   - Added `--meta-agent ENGINE` flag for future meta-agent decisions
+   - Updated help documentation with examples
+
+5. **Solution Comparison (Similar Results Case)**
+   - Automatically detects when solutions are similar (>80% line count similarity)
+   - Auto-accepts first solution when all engines produce similar results
+   - Stores metadata about consensus decisions in JSON format
+
+6. **Future-Proof Architecture**
+   - Meta-agent infrastructure ready for "different results" case
+   - Modular design allows easy addition of specialization and race modes
+   - Metrics tracking placeholders for performance analysis
+
+### Files Created/Modified
+
+**New Files:**
+- `.ralphy/modes.sh` - Multi-engine execution modes (429 lines)
+- `.ralphy/meta-agent.sh` - Meta-agent resolver (152 lines)
+- `test_consensus.sh` - Test suite for consensus mode validation
+
+**Modified Files:**
+- `ralphy.sh` - Added consensus mode integration (40+ lines changed)
+  - Added EXECUTION_MODE, CONSENSUS_ENGINES, META_AGENT_ENGINE variables
+  - Added CLI flag parsing for consensus options
+  - Modified run_brownfield_task() to check for consensus mode
+  - Updated help text with multi-engine options and examples
+
+### How It Works
+
+1. User runs: `./ralphy.sh "task" --consensus-engines "claude,cursor"`
+2. Consensus mode creates isolated worktrees for each engine
+3. Both engines run in parallel on the same task
+4. Solutions are compared using git diff similarity
+5. If similar (>80%): Auto-accept first solution
+6. If different: Ready for meta-agent review (future implementation)
+7. Winning solution is merged back to main branch
+8. Metadata stored in `.ralphy/consensus/<consensus-id>/metadata.json`
+
+### Testing
+
+All tests pass:
+- ✓ Module syntax validation
+- ✓ Function definition checks
+- ✓ CLI flag recognition
+- ✓ Help documentation completeness
+- ✓ Integration with ralphy.sh
+
+### Example Usage
+
+```bash
+# Run consensus mode with 2 engines (Claude and Cursor)
+./ralphy.sh "add authentication middleware" --consensus-engines "claude,cursor"
+
+# Run with 3 engines
+./ralphy.sh "fix critical bug" --consensus-engines "claude,opencode,cursor"
+
+# Specify meta-agent for future different-results case
+./ralphy.sh "refactor database layer" --consensus-engines "claude,cursor" --meta-agent claude
+```
+
+### Architecture Notes
+
+The implementation follows the MultiAgentPlan.md specification:
+- Phase 1: Core infrastructure ✓
+- Phase 2: Consensus mode (similar results) ✓
+- Phase 2 (next): Meta-agent for different results (infrastructure ready)
+
+### Next Steps (Future Enhancements)
+
+1. Implement meta-agent decision logic for different results
+2. Add specialization mode with pattern matching
+3. Add race mode with first-success logic
+4. Add metrics tracking and adaptive engine selection
+5. Add cost estimation and limits
+6. Add validation gates (tests, lint, build)
