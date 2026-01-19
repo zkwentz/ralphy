@@ -609,14 +609,14 @@ Running multiple engines increases costs. Strategies:
 #### Manual Testing Checklist
 - [x] Consensus mode with 2 engines (similar results)
 - [x] Consensus mode with 2 engines (different results)
-- [ ] Specialization with matching rules
-- [ ] Specialization with no matching rules
-- [ ] Race mode with early winner
-- [ ] Race mode with all failures
-- [ ] Meta-agent decision parsing
-- [ ] Metrics recording and adaptive selection
-- [ ] Cost limit enforcement
-- [ ] Validation gate failures
+- [x] Specialization with matching rules
+- [x] Specialization with no matching rules
+- [x] Race mode with early winner
+- [x] Race mode with all failures
+- [x] Meta-agent decision parsing
+- [x] Metrics recording and adaptive selection
+- [x] Cost limit enforcement
+- [x] Validation gate failures
 
 ### 11. Migration Path
 
