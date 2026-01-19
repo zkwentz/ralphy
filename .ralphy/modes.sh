@@ -1,247 +1,393 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# ============================================
-# Ralphy - Multi-Engine Execution Modes
-# ============================================
-# This module implements different execution modes for multi-engine AI task execution:
-# - Specialization Mode: Routes tasks to specialized engines based on pattern matching
-# - Consensus Mode: Runs multiple engines and uses meta-agent to select best solution (future)
-# - Race Mode: Runs multiple engines in parallel, first success wins (future)
-# ============================================
+# Consensus Mode Implementation
+# Runs multiple engines on the same task and compares results
 
-# Relaxed error handling for library mode
-set -eo pipefail
+run_consensus_agent() {
+  local task_name="$1"
+  local engine="$2"
+  local agent_num="$3"
+  local output_file="$4"
+  local status_file="$5"
+  local log_file="$6"
 
-# ============================================
-# SPECIALIZATION MODE
-# ============================================
+  echo "setting up" > "$status_file"
 
-# Match a task description against specialization rules from config
-# Returns: matched engine name or empty string
-match_specialization_rule() {
-  local task_desc="$1"
-  local config_file="${2:-$CONFIG_FILE}"
+  # Log setup info
+  echo "Consensus Agent $agent_num ($engine) starting for task: $task_name" >> "$log_file"
+  echo "ORIGINAL_DIR=$ORIGINAL_DIR" >> "$log_file"
+  echo "WORKTREE_BASE=$WORKTREE_BASE" >> "$log_file"
+  echo "BASE_BRANCH=$BASE_BRANCH" >> "$log_file"
 
-  # Check if config file exists and has specialization_rules
-  if [[ ! -f "$config_file" ]]; then
-    log_debug "Config file not found, skipping specialization matching"
-    return 0
+  # Create isolated worktree for this consensus agent
+  local worktree_info
+  worktree_info=$(create_agent_worktree "$task_name" "$agent_num" 2>>"$log_file")
+  local worktree_dir="${worktree_info%%|*}"
+  local branch_name="${worktree_info##*|}"
+
+  echo "Worktree dir: $worktree_dir" >> "$log_file"
+  echo "Branch name: $branch_name" >> "$log_file"
+
+  if [[ ! -d "$worktree_dir" ]]; then
+    echo "failed" > "$status_file"
+    echo "ERROR: Worktree directory does not exist: $worktree_dir" >> "$log_file"
+    echo "0 0" > "$output_file"
+    return 1
   fi
 
-  # Check if yq is available for YAML parsing
-  if ! command -v yq &>/dev/null; then
-    log_debug "yq not available, skipping specialization matching"
-    return 0
+  echo "running" > "$status_file"
+
+  # Copy PRD file to worktree from original directory
+  if [[ "$PRD_SOURCE" == "markdown" ]] || [[ "$PRD_SOURCE" == "yaml" ]]; then
+    cp "$ORIGINAL_DIR/$PRD_FILE" "$worktree_dir/" 2>/dev/null || true
   fi
 
-  # Check if specialization_rules section exists
-  if ! yq eval '.engines.specialization_rules' "$config_file" &>/dev/null; then
-    log_debug "No specialization_rules in config"
-    return 0
-  fi
+  # Ensure .ralphy/ and progress.txt exist in worktree
+  mkdir -p "$worktree_dir/$RALPHY_DIR"
+  touch "$worktree_dir/$PROGRESS_FILE"
 
-  # Get number of rules
-  local rules_count
-  rules_count=$(yq eval '.engines.specialization_rules | length' "$config_file" 2>/dev/null || echo "0")
+  # Build prompt for this specific task
+  local prompt="You are working on a specific task. Focus ONLY on this task:
 
-  if [[ "$rules_count" -eq 0 ]]; then
-    log_debug "No specialization rules defined"
-    return 0
-  fi
+TASK: $task_name
 
-  # Iterate through rules and find first match
-  local idx=0
-  while [[ $idx -lt $rules_count ]]; do
-    local pattern
-    local engines
-    local mode
-    local description
+Instructions:
+1. Implement this specific task completely
+2. Write tests if appropriate
+3. Update $PROGRESS_FILE with what you did
+4. Commit your changes with a descriptive message
 
-    pattern=$(yq eval ".engines.specialization_rules[$idx].pattern" "$config_file" 2>/dev/null || echo "")
-    engines=$(yq eval ".engines.specialization_rules[$idx].engines[0]" "$config_file" 2>/dev/null || echo "")
-    mode=$(yq eval ".engines.specialization_rules[$idx].mode" "$config_file" 2>/dev/null || echo "")
-    description=$(yq eval ".engines.specialization_rules[$idx].description" "$config_file" 2>/dev/null || echo "")
+Do NOT modify PRD.md or mark tasks complete - that will be handled separately.
+Focus only on implementing: $task_name"
 
-    # Skip if pattern is empty or null
-    if [[ -z "$pattern" ]] || [[ "$pattern" == "null" ]]; then
-      ((idx++)) || true
-      continue
-    fi
+  # Temp file for AI output
+  local tmpfile
+  tmpfile=$(mktemp)
 
-    # Check if task description matches pattern (case-insensitive)
-    if echo "$task_desc" | grep -qiE "$pattern"; then
-      log_debug "Matched specialization rule: $description"
-      log_debug "Pattern: $pattern -> Engine: $engines"
+  # Run AI agent in the worktree directory with specified engine
+  local result=""
+  local success=false
+  local retry=0
 
-      # Return the matched engine (first one if multiple)
-      if [[ -n "$engines" ]] && [[ "$engines" != "null" ]]; then
-        echo "$engines"
-        return 0
+  while [[ $retry -lt ${MAX_RETRIES:-3} ]]; do
+    case "$engine" in
+      opencode)
+        (
+          cd "$worktree_dir"
+          OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+            --format json \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      cursor)
+        (
+          cd "$worktree_dir"
+          agent --print --force \
+            --output-format stream-json \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      qwen)
+        (
+          cd "$worktree_dir"
+          qwen --output-format stream-json \
+            --approval-mode yolo \
+            -p "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      droid)
+        (
+          cd "$worktree_dir"
+          droid exec --output-format stream-json \
+            --auto medium \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      codex)
+        (
+          cd "$worktree_dir"
+          CODEX_LAST_MESSAGE_FILE="$tmpfile.last"
+          rm -f "$CODEX_LAST_MESSAGE_FILE"
+          codex exec --full-auto \
+            --json \
+            --output-last-message "$CODEX_LAST_MESSAGE_FILE" \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      claude|*)
+        (
+          cd "$worktree_dir"
+          claude --dangerously-skip-permissions \
+            --verbose \
+            -p "$prompt" \
+            --output-format stream-json
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+    esac
+
+    result=$(cat "$tmpfile" 2>/dev/null || echo "")
+
+    if [[ -n "$result" ]]; then
+      local error_msg
+      if ! error_msg=$(check_for_errors "$result"); then
+        ((retry++)) || true
+        echo "API error: $error_msg (attempt $retry/${MAX_RETRIES:-3})" >> "$log_file"
+        sleep "${RETRY_DELAY:-5}"
+        continue
       fi
+      success=true
+      break
     fi
 
-    ((idx++)) || true
+    ((retry++)) || true
+    echo "Retry $retry/${MAX_RETRIES:-3} after empty response" >> "$log_file"
+    sleep "${RETRY_DELAY:-5}"
   done
 
-  # No match found
-  log_debug "No specialization rule matched for task: ${task_desc:0:50}..."
-  return 0
-}
+  rm -f "$tmpfile"
 
-# Get the best engine for a task using specialization mode
-# Returns: engine name or the default engine
-get_engine_for_task() {
-  local task_desc="$1"
-  local default_engine="${2:-$AI_ENGINE}"
-  local config_file="${3:-$CONFIG_FILE}"
+  if [[ "$success" == true ]]; then
+    # Parse tokens
+    local parsed input_tokens output_tokens
+    local CODEX_LAST_MESSAGE_FILE="${tmpfile}.last"
+    parsed=$(parse_ai_result "$result")
+    local token_data
+    token_data=$(echo "$parsed" | sed -n '/^---TOKENS---$/,$p' | tail -3)
+    input_tokens=$(echo "$token_data" | sed -n '1p')
+    output_tokens=$(echo "$token_data" | sed -n '2p')
+    [[ "$input_tokens" =~ ^[0-9]+$ ]] || input_tokens=0
+    [[ "$output_tokens" =~ ^[0-9]+$ ]] || output_tokens=0
+    rm -f "${tmpfile}.last"
 
-  # Try to match specialization rule
-  local matched_engine
-  matched_engine=$(match_specialization_rule "$task_desc" "$config_file")
-
-  # If match found and engine is available, use it
-  if [[ -n "$matched_engine" ]] && [[ "$matched_engine" != "null" ]]; then
-    # Validate engine is available
-    if validate_engine_available "$matched_engine"; then
-      echo "$matched_engine"
-      return 0
-    else
-      log_warn "Matched engine '$matched_engine' not available, using default"
-    fi
-  fi
-
-  # Fall back to default engine
-  echo "$default_engine"
-  return 0
-}
-
-# Validate if an engine is available/installed
-validate_engine_available() {
-  local engine="$1"
-
-  case "$engine" in
-    claude)
-      command -v claude &>/dev/null
-      ;;
-    opencode)
-      command -v opencode &>/dev/null
-      ;;
-    cursor)
-      command -v agent &>/dev/null
-      ;;
-    codex)
-      command -v codex &>/dev/null
-      ;;
-    qwen)
-      command -v qwen &>/dev/null
-      ;;
-    droid)
-      command -v droid &>/dev/null
-      ;;
-    *)
-      log_warn "Unknown engine: $engine"
+    # Ensure at least one commit exists before marking success
+    local commit_count
+    commit_count=$(git -C "$worktree_dir" rev-list --count "$BASE_BRANCH"..HEAD 2>/dev/null || echo "0")
+    [[ "$commit_count" =~ ^[0-9]+$ ]] || commit_count=0
+    if [[ "$commit_count" -eq 0 ]]; then
+      echo "ERROR: No new commits created; treating task as failed." >> "$log_file"
+      echo "failed" > "$status_file"
+      echo "0 0" > "$output_file"
+      cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
       return 1
-      ;;
-  esac
-}
+    fi
 
-# Run a task with specialization mode
-# This determines the best engine for the task and sets AI_ENGINE accordingly
-run_specialization_mode() {
-  local task_desc="$1"
-  local config_file="${2:-$CONFIG_FILE}"
+    # Store solution for comparison
+    mkdir -p "$ORIGINAL_DIR/.ralphy/consensus"
+    local solution_dir="$ORIGINAL_DIR/.ralphy/consensus/$(echo "$task_name" | tr ' /' '__')"
+    mkdir -p "$solution_dir"
 
-  # Save original engine
-  local original_engine="$AI_ENGINE"
+    # Save git diff and commit info
+    (
+      cd "$worktree_dir"
+      git diff "$BASE_BRANCH" > "$solution_dir/${engine}_diff.patch"
+      git log "$BASE_BRANCH"..HEAD --format="%H|%s|%b" > "$solution_dir/${engine}_commits.txt"
+      git diff "$BASE_BRANCH" --stat > "$solution_dir/${engine}_stats.txt"
+    ) 2>>"$log_file"
 
-  # Get specialized engine for this task
-  local specialized_engine
-  specialized_engine=$(get_engine_for_task "$task_desc" "$AI_ENGINE" "$config_file")
+    # Write success output (include branch name for later retrieval)
+    echo "done" > "$status_file"
+    echo "$input_tokens $output_tokens $branch_name" > "$output_file"
 
-  # Update AI_ENGINE if different
-  if [[ "$specialized_engine" != "$AI_ENGINE" ]]; then
-    log_info "Specialization: Using $specialized_engine for this task (default: $AI_ENGINE)"
-    AI_ENGINE="$specialized_engine"
+    # Keep worktree for meta-agent comparison (don't cleanup yet)
+    echo "$worktree_dir" > "$solution_dir/${engine}_worktree.txt"
+
+    return 0
+  else
+    echo "failed" > "$status_file"
+    echo "0 0" > "$output_file"
+    cleanup_agent_worktree "$worktree_dir" "$branch_name" "$log_file"
+    return 1
   fi
-
-  # Return success - caller should use the updated AI_ENGINE
-  return 0
 }
-
-# ============================================
-# CONSENSUS MODE (Future Implementation)
-# ============================================
 
 run_consensus_mode() {
-  log_error "Consensus mode not yet implemented"
-  return 1
-}
+  local task_name="$1"
+  local engines_str="${2:-claude,cursor}"  # Default to claude and cursor
 
-# ============================================
-# RACE MODE (Future Implementation)
-# ============================================
+  # Split engines string into array
+  IFS=',' read -ra ENGINES <<< "$engines_str"
+  local num_engines="${#ENGINES[@]}"
 
-run_race_mode() {
-  log_error "Race mode not yet implemented"
-  return 1
-}
-
-# ============================================
-# MIXED MODE (Future Implementation)
-# ============================================
-
-run_mixed_mode() {
-  log_error "Mixed mode not yet implemented"
-  return 1
-}
-
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-
-# Get default mode from config
-get_default_mode() {
-  local config_file="${1:-$CONFIG_FILE}"
-
-  if [[ ! -f "$config_file" ]] || ! command -v yq &>/dev/null; then
-    echo "single"
-    return 0
+  if [[ "$num_engines" -lt 2 ]]; then
+    log_error "Consensus mode requires at least 2 engines (provided: $num_engines)"
+    return 1
   fi
 
-  local mode
-  mode=$(yq eval '.engines.default_mode' "$config_file" 2>/dev/null || echo "single")
+  log_info "Running ${BOLD}consensus mode${RESET} with ${num_engines} engines: ${ENGINES[*]}"
 
-  if [[ -z "$mode" ]] || [[ "$mode" == "null" ]]; then
-    echo "single"
-  else
-    echo "$mode"
+  # Create temp directory for tracking agents
+  local temp_dir="$ORIGINAL_DIR/.ralphy/temp"
+  mkdir -p "$temp_dir"
+
+  # Arrays to track agent PIDs and files
+  local agent_pids=()
+  local output_files=()
+  local status_files=()
+  local log_files=()
+  local branch_names=()
+
+  # Launch all consensus agents in parallel
+  local agent_num=1
+  for engine in "${ENGINES[@]}"; do
+    local output_file="$temp_dir/consensus_agent_${agent_num}_output.txt"
+    local status_file="$temp_dir/consensus_agent_${agent_num}_status.txt"
+    local log_file="$temp_dir/consensus_agent_${agent_num}_log.txt"
+
+    echo "pending" > "$status_file"
+    echo "0 0" > "$output_file"
+    > "$log_file"
+
+    # Run agent in background
+    run_consensus_agent "$task_name" "$engine" "$agent_num" "$output_file" "$status_file" "$log_file" &
+    local pid=$!
+
+    agent_pids+=("$pid")
+    output_files+=("$output_file")
+    status_files+=("$status_file")
+    log_files+=("$log_file")
+
+    log_info "  Launched $engine (agent $agent_num, PID $pid)"
+    ((agent_num++))
+  done
+
+  # Monitor progress with spinner
+  log_info "Waiting for all ${num_engines} consensus agents to complete..."
+  local all_done=false
+  local check_interval=2
+
+  while [[ "$all_done" == false ]]; do
+    all_done=true
+    local status_summary=""
+
+    for i in "${!status_files[@]}"; do
+      local status=$(cat "${status_files[$i]}" 2>/dev/null || echo "pending")
+      status_summary+=" [${ENGINES[$i]}:$status]"
+
+      if [[ "$status" != "done" ]] && [[ "$status" != "failed" ]]; then
+        all_done=false
+      fi
+    done
+
+    if [[ "$all_done" == false ]]; then
+      echo -ne "\r  Status:$status_summary"
+      sleep "$check_interval"
+    fi
+  done
+
+  echo ""  # New line after status updates
+
+  # Wait for all agents to complete
+  for pid in "${agent_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Collect results
+  local successful_engines=()
+  local failed_engines=()
+  local total_input_tokens=0
+  local total_output_tokens=0
+
+  for i in "${!status_files[@]}"; do
+    local status=$(cat "${status_files[$i]}" 2>/dev/null || echo "failed")
+    local engine="${ENGINES[$i]}"
+
+    if [[ "$status" == "done" ]]; then
+      successful_engines+=("$engine")
+      local output=$(cat "${output_files[$i]}" 2>/dev/null || echo "0 0")
+      local input_tokens=$(echo "$output" | awk '{print $1}')
+      local output_tokens=$(echo "$output" | awk '{print $2}')
+      local branch_name=$(echo "$output" | awk '{print $3}')
+
+      [[ "$input_tokens" =~ ^[0-9]+$ ]] || input_tokens=0
+      [[ "$output_tokens" =~ ^[0-9]+$ ]] || output_tokens=0
+
+      total_input_tokens=$((total_input_tokens + input_tokens))
+      total_output_tokens=$((total_output_tokens + output_tokens))
+      branch_names+=("$branch_name")
+
+      log_info "  ✓ $engine completed successfully (branch: $branch_name)"
+    else
+      failed_engines+=("$engine")
+      log_error "  ✗ $engine failed"
+    fi
+  done
+
+  # Check if we have at least 2 successful results to compare
+  if [[ "${#successful_engines[@]}" -lt 2 ]]; then
+    log_error "Consensus mode failed: only ${#successful_engines[@]} engine(s) succeeded (need at least 2)"
+    return 1
   fi
-}
 
-# Log debug message (only if VERBOSE is true)
-log_debug() {
-  if [[ "${VERBOSE:-false}" == "true" ]]; then
-    echo "${DIM}[DEBUG]${RESET} $*" >&2
+  log_info "Consensus agents completed: ${#successful_engines[@]} succeeded, ${#failed_engines[@]} failed"
+  log_info "Total tokens: input=$total_input_tokens, output=$total_output_tokens"
+
+  # Compare solutions using meta-agent
+  log_info "Comparing solutions from: ${successful_engines[*]}"
+
+  local solution_dir="$ORIGINAL_DIR/.ralphy/consensus/$(echo "$task_name" | tr ' /' '__')"
+  local meta_result
+  meta_result=$(run_meta_agent_comparison "$task_name" "$solution_dir" "${successful_engines[@]}")
+
+  local chosen_engine=$(echo "$meta_result" | grep "^CHOSEN:" | cut -d':' -f2 | xargs)
+  local reasoning=$(echo "$meta_result" | grep -A100 "^REASONING:" | tail -n +2)
+
+  if [[ -z "$chosen_engine" ]]; then
+    log_error "Meta-agent failed to choose a solution"
+    return 1
   fi
-}
 
-# Log warning message
-log_warn() {
-  echo "${YELLOW}[WARN]${RESET} $*" >&2
-}
+  log_info "Meta-agent selected: ${BOLD}$chosen_engine${RESET}"
+  log_info "Reasoning: $reasoning"
 
-# Log error message
-log_error() {
-  echo "${RED}[ERROR]${RESET} $*" >&2
-}
+  # Apply the chosen solution
+  local chosen_branch=""
+  for i in "${!successful_engines[@]}"; do
+    if [[ "${successful_engines[$i]}" == "$chosen_engine" ]]; then
+      chosen_branch="${branch_names[$i]}"
+      break
+    fi
+  done
 
-# Export functions for use in main script
-export -f match_specialization_rule
-export -f get_engine_for_task
-export -f validate_engine_available
-export -f run_specialization_mode
-export -f run_consensus_mode
-export -f run_race_mode
-export -f run_mixed_mode
-export -f get_default_mode
-export -f log_debug
+  if [[ -z "$chosen_branch" ]]; then
+    log_error "Could not find branch for chosen engine: $chosen_engine"
+    return 1
+  fi
+
+  log_info "Applying solution from branch: $chosen_branch"
+
+  # Merge chosen branch into current branch
+  (
+    cd "$ORIGINAL_DIR"
+    git merge "$chosen_branch" --no-edit -m "Consensus mode: Apply solution from $chosen_engine
+
+Selected by meta-agent from ${#successful_engines[@]} solutions.
+
+Reasoning: $reasoning"
+  ) || {
+    log_error "Failed to merge chosen solution"
+    return 1
+  }
+
+  # Cleanup all consensus worktrees
+  for engine in "${successful_engines[@]}"; do
+    local worktree_file="$solution_dir/${engine}_worktree.txt"
+    if [[ -f "$worktree_file" ]]; then
+      local worktree_path=$(cat "$worktree_file")
+      if [[ -d "$worktree_path" ]]; then
+        local branch_to_cleanup=""
+        for i in "${!successful_engines[@]}"; do
+          if [[ "${successful_engines[$i]}" == "$engine" ]]; then
+            branch_to_cleanup="${branch_names[$i]}"
+            break
+          fi
+        done
+        if [[ -n "$branch_to_cleanup" ]]; then
+          cleanup_agent_worktree "$worktree_path" "$branch_to_cleanup" "${log_files[$i]}"
+        fi
+      fi
+    fi
+  done
+
+  log_info "Consensus mode completed successfully"
+  return 0
+}
